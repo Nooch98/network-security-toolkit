@@ -8,10 +8,11 @@ import sys
 import threading
 import time
 import io
+import socket
 from typing import Dict, List, Optional, Set, Tuple
 
 from colorama import init as colorama_init
-from rich.console import Console
+from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
@@ -125,6 +126,8 @@ class MitMDetection:
         self.json_out = json_out
         self.active_scan = active_scan
         self.log_only = log_only
+        self.network_map = {}
+        self.open_ports: Dict[str, Set[int]] = {}
 
         # UI related variables
         self.console = Console()
@@ -177,22 +180,8 @@ class MitMDetection:
         self.dns_cache = DNSCache(resolvers=["8.8.8.8", "1.1.1.1", "9.9.9.9"], ttl_default=300, timeout=2.0)
 
         self._setup_logging(log_level)
-        self._warn_if_not_root()
-
+    
     # -------------------- setup --------------------
-    def _warn_if_not_root(self):
-        try:
-            is_root = False
-            if hasattr(os, 'geteuid'):
-                is_root = (os.geteuid() == 0)
-            else:
-                # Windows: check admin token presence heuristically
-                is_root = bool(os.environ.get('USERNAME'))  # not reliable; still warn below
-            if not is_root:
-                self.console.print(Panel("[bold yellow]Warning:[/] running without admin/root privileges may break packet capture/emit."))
-        except Exception:
-            pass
-
     def _get_local_ipv6_for_interface(self) -> Optional[str]:
         """Best-effort to obtain link-local IPv6 for the interface."""
         try:
@@ -208,15 +197,12 @@ class MitMDetection:
         lvl = getattr(logging, (level or 'INFO').upper(), logging.INFO)
         logging.basicConfig(
             level=lvl,
-            format='%(asctime)s - %(levelname)s - %(message)s',
-            filename='mitm_detector.log',
-            filemode='a',
+            format='%(message)s',
+            datefmt='[%X]',
+            handlers=[
+                logging.FileHandler('mitm_detector.log', mode='a'),
+            ],
         )
-        # also log to stderr
-        console_handler = logging.StreamHandler()
-        console_handler.setLevel(lvl)
-        console_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-        logging.getLogger().addHandler(console_handler)
 
     # -------------------- logging & alerts --------------------
     def _write_json_event(self, payload: dict):
@@ -233,7 +219,7 @@ class MitMDetection:
         try:
             filename = f"{alert_type.lower()}_alerts.pcap"
             wrpcap(filename, packet, append=True)
-            logging.warning(f"[!] Malicious packet logged to '{filename}'.")
+            logging.critical(f"[!] Malicious packet logged to '{filename}'.")
         except Exception as e:
             logging.error(f"Failed to write pcap: {e}")
 
@@ -306,13 +292,12 @@ class MitMDetection:
 
     def discover_network_devices(self):
         with self.ui_lock:
-            self.console.log("[bold cyan]Discovering devices on the network...[/bold cyan]")
+            self.network_map = {}
+            self.open_ports = {}
         if self.active_scan:
             self.discover_network_devices_ipv4()
             self.discover_network_devices_ipv6()
         self.discover_system_dns()
-        with self.ui_lock:
-            self.console.log("[bold green]Network discovery complete. Starting monitoring...[/bold green]")
 
     def run_periodic_scans(self):
         while self.active and not self.passive_mode and not self.test_mode and not self.stop_event.is_set():
@@ -329,12 +314,10 @@ class MitMDetection:
                     if self.gateway_ip_v4 and self.gateway_mac_v4 and self.my_ip:
                         arp_packet = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(op=2, psrc=self.gateway_ip_v4, hwsrc=self.gateway_mac_v4, pdst=self.my_ip)
                         sendp(arp_packet, iface=self.interface, verbose=False)
-                        logging.info(f"[+] ARP countermeasure: {self.gateway_ip_v4} -> {self.gateway_mac_v4}")
 
                     if self.gateway_ip_v6 and self.gateway_mac_v6:
                         nd_packet = Ether(dst=self.gateway_mac_v6) / IPv6(src=self.gateway_ip_v6, dst="ff02::1") / ICMPv6ND_NA(tgt=self.gateway_ip_v6, S=1, R=1, O=1)
                         sendp(nd_packet, iface=self.interface, verbose=False)
-                        logging.info(f"[+] ND countermeasure: {self.gateway_ip_v6} -> {self.gateway_mac_v6}")
                 except Exception as e:
                     logging.debug(f"Countermeasure error: {e}")
             if self.stop_event.wait(3):
@@ -358,19 +341,41 @@ class MitMDetection:
             if self.stop_event.wait(10):
                 break
 
+    def _port_scan_worker(self):
+        while self.active and not self.stop_event.is_set():
+            if self.network_map:
+                for ip in self.network_map:
+                    if ip not in self.open_ports:
+                        with self.ui_lock:
+                            self.open_ports[ip] = set()
+                        self._scan_ports(ip)
+            if self.stop_event.wait(30):
+                break
+
+    def _scan_ports(self, ip: str):
+        ports_to_scan = [22, 25, 80, 139, 443, 445, 3389, 8080]
+        for port in ports_to_scan:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(0.5)
+            try:
+                if sock.connect_ex((ip, port)) == 0:
+                    with self.ui_lock:
+                        self.open_ports[ip].add(port)
+            except Exception as e:
+                logging.debug(f"Port scan error {ip}:{port}: {e}")
+            finally:
+                sock.close()
+
     # -------------------- test mode --------------------
     def test_dns_spoofing(self):
-        with self.ui_lock:
-            self.console.log("[*] [bold cyan]Starting DNS Spoofing attack simulation...[/bold cyan]")
+        logging.info("[*] Starting DNS Spoofing attack simulation...")
         if not self.my_ip or not self.gateway_ip_v4 or not self.my_mac or not self.gateway_mac_v4:
-            with self.ui_lock:
-                self.console.log("Could not get IP/MAC and/or gateway. Cannot run DNS Spoofing test.")
+            logging.warning("Could not get IP/MAC and/or gateway. Cannot run DNS Spoofing test.")
             return
 
         test_domain = "test.com"
         test_ip = "1.2.3.4"
 
-        # Legitimate DNS query packet
         dns_query_packet = (
             Ether(src=self.my_mac, dst=self.gateway_mac_v4)
             / IP(src=self.my_ip, dst=self.gateway_ip_v4)
@@ -378,7 +383,6 @@ class MitMDetection:
             / DNS(id=1234, qr=0, rd=1, qd=DNSQR(qname=test_domain, qtype="A"))
         )
 
-        # Malicious DNS response packet
         dns_spoofed_packet = (
             Ether(src=self.gateway_mac_v4, dst=self.my_mac)
             / IP(src=self.gateway_ip_v4, dst=self.my_ip)
@@ -397,8 +401,7 @@ class MitMDetection:
         for pkt in (dns_query_packet, dns_spoofed_packet):
             self.handle_packet(pkt)
 
-        with self.ui_lock:
-            self.console.log("[*] [bold green]Attack test finished.[/bold green]")
+        logging.info("[*] Attack test finished.")
         self.stop()
 
     # -------------------- packet handlers --------------------
@@ -420,7 +423,7 @@ class MitMDetection:
             if arp_src_ip not in self.arp_table or self.arp_table[arp_src_ip] != arp_src_mac:
                 with self.ui_lock:
                     self.arp_table[arp_src_ip] = arp_src_mac
-                    self.console.log(f"New ARP entry: IP {arp_src_ip} -> MAC {arp_src_mac}")
+                    self.network_map[arp_src_ip] = {'mac': arp_src_mac, 'is_router': (arp_src_ip == self.gateway_ip_v4)}
         except Exception:
             pass
 
@@ -431,15 +434,16 @@ class MitMDetection:
                 target_mac = packet[Ether].src
                 if target_ip not in self.trusted_ips:
                     self.trusted_ips.add(target_ip)
-                    logging.info(f"[*] IPv6 device trusted: {target_ip} -> {target_mac}")
+                    self.network_map[target_ip] = {'mac': target_mac, 'is_router': (target_ip == self.gateway_ip_v6)}
 
             if packet.haslayer(ICMPv6ND_RA):
                 router_ip = packet[IPv6].src
+                router_mac = packet[Ether].src
                 if router_ip not in self.trusted_ips:
                     self.trusted_ips.add(router_ip)
                     self.gateway_ip_v6 = router_ip
-                    self.gateway_mac_v6 = packet[Ether].src
-                    logging.info(f"[*] IPv6 gateway: {router_ip}")
+                    self.gateway_mac_v6 = router_mac
+                    self.network_map[router_ip] = {'mac': self.gateway_mac_v6, 'is_router': True}
 
             if packet.haslayer(ICMPv6ND_NA) or packet.haslayer(ICMPv6ND_NS):
                 target_ip = packet[IPv6].src
@@ -454,10 +458,10 @@ class MitMDetection:
                 if target_ip not in self.neighbor_table or self.neighbor_table[target_ip] != target_mac:
                     with self.ui_lock:
                         self.neighbor_table[target_ip] = target_mac
-                        self.console.log(f"New IPv6 ND entry: IP {target_ip} -> MAC {target_mac}")
+                        self.network_map[target_ip] = {'mac': target_mac, 'is_router': (target_ip == self.gateway_ip_v6)}
         except Exception:
             pass
-
+    
     def check_dns_query(self, packet):
         try:
             if packet.haslayer(DNS) and packet[DNS].qr == 0:
@@ -470,7 +474,6 @@ class MitMDetection:
             if not (packet.haslayer(DNS) and packet[DNS].qr == 1):
                 return
 
-            # Ignore link-local responders
             response_src_ip = None
             if packet.haslayer(IP):
                 response_src_ip = packet[IP].src
@@ -489,17 +492,12 @@ class MitMDetection:
             except Exception:
                 query_name = str(query_name_raw).strip('.')
 
-            # Ignore mDNS/LLMNR like names
             if query_name.endswith('.local'):
-                with self.ui_lock:
-                    self.console.log(f"[*] Ignoring local query: {query_name}")
                 return
 
-            # extract A records from answer
             packet_resolved_ips: List[str] = []
             ancount = int(getattr(packet[DNS], 'ancount', 0) or 0)
             if ancount > 0 and getattr(packet[DNS], 'an', None):
-                # scapy chains answers; iterate safely
                 ans = packet[DNS].an
                 for _ in range(ancount):
                     if getattr(ans, 'type', None) == 1 and hasattr(ans, 'rdata'):
@@ -512,7 +510,6 @@ class MitMDetection:
                 self.log_alert("DNS_EMPTY_RESPONSE", f"Empty DNS response for '{query_name}'", "Possible capture error; not an attack")
                 return
 
-            # Validate using cache; do not flag spoofing solely due to no-Internet
             valid_ips = self.dns_cache.resolve_a(query_name)
             is_spoofed = bool(valid_ips) and not any(ip in valid_ips for ip in packet_resolved_ips)
 
@@ -524,7 +521,6 @@ class MitMDetection:
                     packet=packet,
                 )
 
-            # stash for potential SSLStrip heuristic
             self.dns_responses[query_name] = set(packet_resolved_ips)
         except Exception as e:
             logging.debug(f"DNS response check error: {e}")
@@ -550,7 +546,6 @@ class MitMDetection:
     def handle_dhcp_packet(self, packet):
         try:
             if packet.haslayer(DHCP) and packet[DHCP].options:
-                # DHCP Offer (option 53 == 2)
                 opts = packet[DHCP].options
                 msg_type = next((v for k, v in opts if k == 'message-type'), None)
                 if msg_type == 2:  # Offer
@@ -592,41 +587,46 @@ class MitMDetection:
                 f"[bold white]IPv4 Gateway:[/] {self.gateway_ip_v4} ({self.gateway_mac_v4})\n"
                 f"[bold white]Packets processed:[/] {self.packet_count}",
                 title="Detection Status",
+                border_style="green"
             )
 
-            devices_table = Table(title="Network Devices")
-            devices_table.add_column("IP", style="cyan")
-            devices_table.add_column("MAC", style="magenta")
-            for ip, mac in self.arp_table.items():
-                devices_table.add_row(ip, mac)
-            for ip, mac in self.neighbor_table.items():
-                devices_table.add_row(ip, mac)
+            network_map_table = Table(title="[b]Network Devices[/b]", style="dim")
+            network_map_table.add_column("[b]IP[/b]")
+            network_map_table.add_column("[b]MAC[/b]")
+            network_map_table.add_column("[b]Status[/b]")
+            network_map_table.add_column("[b]Open Ports[/b]")
+            
+            for ip, info in self.network_map.items():
+                status = "Router" if info.get('is_router') else "Device"
+                ports = ', '.join(map(str, sorted(list(self.open_ports.get(ip, set()))))) or "Scanning..."
+                network_map_table.add_row(ip, info['mac'], status, ports)
 
+            network_map_panel = Panel(
+                network_map_table,
+                title="[b]Network Map[/b]",
+                border_style="blue"
+            )
+            
             alerts_panel_content = ""
             for timestamp, alert in self.alerts:
                 alerts_panel_content += f"[bold red]{timestamp}[/] - [bold yellow]{alert}[/]\n"
-            alerts_panel = Panel(alerts_panel_content, title="Security Alerts")
+            alerts_panel = Panel(alerts_panel_content, title="Security Alerts", border_style="red", height=6, width=150)
 
-            panels = [status_panel, devices_table, alerts_panel]
-
+            left_group = Group(status_panel, network_map_panel)
+            
             if self.recent_malicious_packet:
-                packet_io = io.StringIO()
-                original_stdout = sys.stdout
-                sys.stdout = packet_io
-                try:
-                    self.recent_malicious_packet.show()
-                finally:
-                    sys.stdout = original_stdout
-                packet_dump = packet_io.getvalue()
-                syntax = Syntax(packet_dump, "python", theme="monokai", line_numbers=False)
-                packet_panel = Panel(syntax, title="Malicious Packet Details")
-                panels.append(packet_panel)
+                packet_dump = self.recent_malicious_packet.show2(dump=True)
+                syntax = Syntax(packet_dump, "go", theme="monokai", line_numbers=False)
+                packet_panel = Panel(syntax, title="Malicious Packet Details", height=60, width=150)
+                
+                right_group = Group(alerts_panel, packet_panel)
+            else:
+                right_group = Group(alerts_panel)
 
-        return Columns(panels)
+        return Columns([left_group, right_group])
 
     def start_ui(self):
         if self.log_only:
-            # headless mode requested; don't open Live UI
             while self.active and not self.stop_event.is_set():
                 if self.stop_event.wait(0.5):
                     break
@@ -666,6 +666,10 @@ class MitMDetection:
         arp_monitor_thread = threading.Thread(target=self.monitor_arp_cache, daemon=True)
         arp_monitor_thread.start()
         threads.append(arp_monitor_thread)
+        
+        port_scan_thread = threading.Thread(target=self._port_scan_worker, daemon=True)
+        port_scan_thread.start()
+        threads.append(port_scan_thread)
 
         if self.active_scan:
             scan_thread = threading.Thread(target=self.run_periodic_scans, daemon=True)
@@ -677,11 +681,10 @@ class MitMDetection:
             countermeasure_thread.start()
             threads.append(countermeasure_thread)
 
-        # UI runs on main thread to preserve terminal state
         try:
             self.start_ui()
         except KeyboardInterrupt:
-            self.console.log("[bold yellow]Interrupted by user[/bold yellow]")
+            pass
         finally:
             self.stop()
             for t in threads:
