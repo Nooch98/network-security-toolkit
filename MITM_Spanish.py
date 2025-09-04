@@ -9,7 +9,9 @@ import threading
 import time
 import io
 import socket
-from typing import Dict, List, Optional, Set, Tuple
+import keyboard
+import requests
+from typing import Dict, List, Optional, Set, Tuple, Union
 
 from colorama import init as colorama_init
 from rich.console import Console, Group
@@ -33,9 +35,10 @@ from scapy.all import (
     conf,
     srp,
     wrpcap,
+    Raw
 )
 from scapy.layers.dns import DNS, DNSQR, DNSRR
-from scapy.layers.inet import UDP
+from scapy.layers.inet import TCP, UDP
 from scapy.layers.l2 import getmacbyip
 from scapy.layers.http import HTTPRequest
 from scapy.layers.dhcp import DHCP
@@ -43,8 +46,27 @@ from scapy.layers.inet6 import ICMPv6ND_RA, ICMPv6ND_NA, ICMPv6ND_NS
 
 import dns.resolver
 
+try:
+    import networkx as nx
+    import matplotlib.pyplot as plt
+    DIAGRAM_LIBS_INSTALLED = True
+except ImportError:
+    DIAGRAM_LIBS_INSTALLED = False
+
 # Inicializar colorama
 colorama_init(autoreset=True)
+
+COMMON_PORTS = {
+    21: "FTP",
+    22: "SSH",
+    23: "Telnet",
+    25: "SMTP",
+    53: "DNS",
+    80: "HTTP",
+    110: "POP3",
+    443: "HTTPS",
+    3389: "RDP"
+}
 
 
 class DNSCache:
@@ -120,14 +142,26 @@ class MitMDetection:
         self.json_out = json_out
         self.active_scan = active_scan
         self.log_only = log_only
-        self.network_map = {}
+        self.network_map: Dict[str, Dict[str, Union[str, bool, None]]] = {}
         self.open_ports: Dict[str, Set[int]] = {}
+        self.image_path: Optional[str] = None
 
         self.console = Console()
         self.alerts: List[Tuple[str, str]] = []
         self.packet_count = 0
         self.ui_lock = threading.Lock()
         self.recent_malicious_packet = None
+        self._devices_per_page = 10
+        self._page_index = 0
+        self.device_fp: Dict[str, Dict[str, Union[Set[str], int]]] = {}
+        self._gateway_candidates = {}
+        self._observed_routers = set()
+        self.tcp_requests: List[Dict] = []
+        self.max_tcp_requests = 10
+        self.oui_database = {}
+        self._load_local_oui_database()
+        self.get_manufacturer_by_mac = self.get_manufacturer_by_mac
+        self.unusual_dns_queries: List[Tuple[str, str, str]] = []
 
         try:
             self.my_ip = get_if_addr(self.interface)
@@ -167,18 +201,20 @@ class MitMDetection:
             "amazon.com",
         ]
 
-        self.dns_cache = DNSCache(["8.8.8.8", "1.1.1.1", "9.9.9.9"])
+        self.dns_cache = DNSCache(["8.8.8.8", "1.1.1.1", "9.9.9.9"], ttl_default=300, timeout=2.0)
 
         self._setup_logging(log_level)
 
     # -------------------- setup --------------------
     def _get_local_ipv6_for_interface(self) -> Optional[str]:
         try:
-            from scapy.all import get_working_if
-            ifname = get_working_if()
-            return None
+            from scapy.all import get_if_addr6
+            ipv6_info = get_if_addr6(self.interface)
+            if ipv6_info and "addr" in ipv6_info:
+                return ipv6_info["addr"]
         except Exception:
-            return None
+            pass
+        return None
 
     def _setup_logging(self, level: str):
         lvl = getattr(logging, (level or 'INFO').upper(), logging.INFO)
@@ -229,6 +265,51 @@ class MitMDetection:
             self.recent_malicious_packet = packet
 
     # -------------------- descubrimiento --------------------
+    def _update_fingerprint(self, ip: str, packet):
+        fp = self.device_fp.setdefault(ip, {'ttls': set(), 'tcp_windows': set(), 'http_ua': set(), 'dhcp_client_ids': set()})
+        try:
+            if packet.haslayer(IP):
+                ttl = packet[IP].ttl
+                fp['ttls'].add(int(ttl))
+            # TCP window size
+            if packet.haslayer('TCP'):
+                win = packet['TCP'].window
+                fp['tcp_windows'].add(int(win))
+            # HTTP User-Agent
+            if packet.haslayer(HTTPRequest):
+                ua = packet[HTTPRequest].User_Agent.decode('utf-8', errors='ignore') if getattr(packet[HTTPRequest], 'User_Agent', None) else None
+                if ua:
+                    fp['http_ua'].add(ua)
+            # DHCP client-id
+            if packet.haslayer(DHCP):
+                opts = packet[DHCP].options
+                for opt in opts:
+                    if isinstance(opt, tuple) and opt[0] == 'client_id':
+                        fp['dhcp_client_ids'].add(str(opt[1]))
+        except Exception:
+            pass
+        
+    def fingerprint_changed(self, ip: str) -> bool:
+        fp = self.device_fp.get(ip)
+        if not fp:
+            return False
+        if len(fp['ttls']) > 2:
+            self.log_alert("FP_CHANGE", f"TTL variable para {ip}", f"TTLs observados: {sorted(fp['ttls'])}")
+            return True
+        return False
+    
+    def _note_router(self, ip: str, mac: str):
+        s = self._gateway_candidates.setdefault(ip, set())
+        s.add(mac)
+        
+        if len(s) > 1:
+            self.log_alert("MULTI_GATEWAY", f"Multiples MACs para gateway {ip}", f"MACs: {sorted(list(s))}")
+            
+    def _note_observed_router(self, ip: str):
+        self._observed_routers.add(ip)
+        if len(self._observed_routers) > 1:
+            self.log_alert("ROGUE_ROUTER", "Se han observado multiples routers en la red", f"Routers: {sorted(list(self._observed_routers))}")
+    
     def discover_system_dns(self):
         try:
             resolver = dns.resolver.Resolver()
@@ -373,6 +454,7 @@ class MitMDetection:
             arp_src_ip = packet[ARP].psrc
             arp_src_mac = packet[ARP].hwsrc
 
+            # Comprobación de ARP Spoofing
             if arp_op == 2:
                 if self.gateway_ip_v4 and arp_src_ip == self.gateway_ip_v4 and self.gateway_mac_v4 and arp_src_mac != self.gateway_mac_v4:
                     self.log_alert(
@@ -385,7 +467,16 @@ class MitMDetection:
             if arp_src_ip not in self.arp_table or self.arp_table[arp_src_ip] != arp_src_mac:
                 with self.ui_lock:
                     self.arp_table[arp_src_ip] = arp_src_mac
-                    self.network_map[arp_src_ip] = {'mac': arp_src_mac, 'is_router': (arp_src_ip == self.gateway_ip_v4)}
+                    
+                    os_type = self.get_os_from_ttl(packet[IP].ttl) if packet.haslayer(IP) else 'N/A'
+                    manufacturer = self.get_manufacturer_by_mac(arp_src_mac)
+                    
+                    self.network_map[arp_src_ip] = {
+                        'mac': arp_src_mac,
+                        'is_router': (arp_src_ip == self.gateway_ip_v4),
+                        'os_type': os_type,
+                        'manufacturer': manufacturer
+                    }
         except Exception:
             pass
 
@@ -426,8 +517,33 @@ class MitMDetection:
         try:
             if packet.haslayer(DNS) and packet[DNS].qr == 0:
                 self.dns_queries[packet[DNS].id] = packet[DNS][DNSQR].qname
-        except Exception:
-            pass
+
+            if packet.haslayer(DNS) and packet.getlayer(DNS).qr == 0:
+                dns_query = packet.getlayer(DNS).qd.qname.decode('utf-8')
+                src_ip = packet.getlayer(IP).src
+                
+                is_unusual = False
+                unusual_reason = ""
+
+                parts = dns_query.split('.')
+                if len(parts[0]) > 30:
+                    is_unusual = True
+                    unusual_reason = f"Subdominio inusualmente largo ({len(parts[0])} caracteres)"
+
+                if not is_unusual:
+                    tld = parts[-2] if len(parts) > 1 else ""
+                    if tld in ["ru", "bit", "cc", "ga", "ml", "tk"]:
+                        is_unusual = True
+                        unusual_reason = f"TLD sospechoso: .{tld}"
+
+                if is_unusual:
+                    with self.ui_lock:
+                        self.unusual_dns_queries.append((time.strftime("%H:%M:%S"), src_ip, dns_query))
+                        if len(self.unusual_dns_queries) > 20:
+                            self.unusual_dns_queries.pop(0)
+
+        except Exception as e:
+            logging.debug(f"Error procesando paquete DNS: {e}")
 
     def check_dns_response(self, packet):
         try:
@@ -510,71 +626,392 @@ class MitMDetection:
                         )
         except Exception:
             pass
+        
+    def get_os_from_ttl(self, ttl: int) -> str:
+        if ttl <= 64:
+            return "Linux/Unix"
+        elif ttl <= 128:
+            return "Windows"
+        elif ttl <= 255:
+            return "Cisco/Solaris"
+        else:
+            return "Desconocido"
+        
+    def check_for_credentials(self, packet):
+        try:
+            if not (packet.haslayer(HTTPRequest) and packet.haslayer(Raw)):
+                return
+            
+            http_layer = packet[HTTPRequest]
+            
+            if http_layer.Method.decode('utf-8').lower() == 'post':
+                raw_payload = packet[Raw].load.decode('utf-8', errors='ignore')
+                
+                keywords = ["password", "user", "login", "pwd", "uname"]
+                
+                if any(keyword in raw_payload.lower() for keyword in keywords):
+                    self.log_alert(
+                        "PLAINTEXT_CREDENTIALS",
+                        "Credenciales de texto plano detectadas",
+                        f"URL: {http_layer.Host.decode('utf-8')}{http_layer.Path.decode('utf-8')}",
+                        packet=packet,
+                        packet_info=self._extract_malicious_packet_info(packet, "PLAINTEXT_CREDENTIALS")
+                    )
+        except Exception:
+            pass
+    
+    def handle_tcp_traffic(self, packet, src_ip, dst_ip):
+        try:
+            if packet.haslayer(TCP):
+                tcp_packet = packet[TCP]
+                flags_str = ""
+                flags = tcp_packet.flags
+                
+                if flags & 0x02: flags_str += "[bold green]S[/bold green]"
+                if flags & 0x10: flags_str += "[bold yellow]A[/bold yellow]"
+                if flags & 0x01: flags_str += "[bold red]F[/bold red]"
+                if flags & 0x04: flags_str += "[bold red]R[/bold red]"
+                if flags & 0x08: flags_str += "[bold cyan]P[/bold cyan]"
+                
+                protocol = COMMON_PORTS.get(tcp_packet.dport, "Desconocido")
+                
+                request_info = {
+                    'time': time.strftime("%H:%M:%S"),
+                    'src_ip': src_ip,
+                    'dst_ip': dst_ip,
+                    'src_port': tcp_packet.sport,
+                    'dst_port': tcp_packet.dport,
+                    'flags': flags_str,
+                    'protocol': protocol
+                }
+                
+                with self.ui_lock:
+                    self.tcp_requests.insert(0, request_info)
+                    if len(self.tcp_requests) > self.max_tcp_requests:
+                        self.tcp_requests.pop()
+        except Exception as e:
+            logging.debug(f"Error procesando paquete TCP: {e}")
+    
+    def check_for_payload_keywords(self, packet):
+        if packet.haslayer(Raw):
+            payload = packet[Raw].load.decode('utf-8', errors='ignore').lower()
+            keywords = ['password', 'login', 'user', 'ftp', 'telnet', 'smtp']
+            
+            if any(kw in payload for kw in keywords):
+                self.log_alert(
+                    "PAYLOAD_SENSITIVE_DATA",
+                    "Datos sensibles detectados en el paquete",
+                    f"Posible protocolo en texto plano",
+                    packet=packet
+                )
 
+    def _load_local_oui_database(self):
+        """Carga una base de datos OUI simple en caso de fallo."""
+        self.oui_database = {
+            'c8:00:84': 'Dell',
+            'f4:30:b9': 'Apple',
+            '3c:91:5b': 'Google',
+            '2c:0b:4b': 'Samsung',
+            'd0:27:01': 'Cisco',
+            '00:0c:29': 'VMware',
+            '00:1a:11': 'Netgear',
+            'ac:3f:a4': 'TP-Link',
+            '00:1b:44': 'TP-Link',
+            '84:ba:3f': 'Xiaomi',
+            '64:9f:8f': 'Huawei',
+            '00:00:00': 'XEROX',
+            '00:00:0a': 'OMRON Corporation',
+            '00:00:0f': 'FUJITSU LIMITED',
+            '00:00:1b': 'NEC Corporation',
+            '00:00:2a': 'NCR Corporation',
+            '00:00:3b': 'SANYO Electric Co., Ltd.',
+            '00:00:4e': 'SONY',
+            '00:00:5c': '3Com Corporation',
+            '00:00:6a': 'IBM',
+            '00:00:7e': 'Texas Instruments',
+            '00:00:8a': 'Canon Inc.',
+            '00:00:9a': 'Nortel Networks',
+            '00:00:a7': 'ALCATEL',
+            '00:00:b4': 'EPSON',
+            '00:00:c8': 'MITSUBISHI ELECTRIC CORPORATION',
+            '00:00:d8': 'SAMSUNG ELECTRONICS CO., LTD.',
+            '00:00:f0': 'Intel Corporation',
+            '00:01:4f': 'Intel Corporation',
+            '00:01:8a': 'Motorola Inc.',
+            '00:01:e3': 'Hewlett Packard',
+        }
+        logging.info("Usando base de datos OUI local.")
+    
+    def get_manufacturer_by_mac(self, mac_address: str):
+        """Busca el fabricante de un dispositivo usando los 6 primeros caracteres (OUI) de su MAC."""
+        try:
+
+            oui_key = mac_address[:8].upper()
+
+            return self.oui_database.get(oui_key, "Desconocido")
+        except Exception:
+            return "Desconocido"
+    
     def handle_packet(self, packet):
         with self.ui_lock:
             self.packet_count += 1
+        
         try:
-            if packet.haslayer(ARP):
-                self.handle_arp(packet)
-            if packet.haslayer(ICMPv6ND_RA) or packet.haslayer(ICMPv6ND_NA) or packet.haslayer(ICMPv6ND_NS):
-                self.handle_ipv6_nd(packet)
-            if packet.haslayer(DNS):
-                self.check_dns_query(packet)
-                self.check_dns_response(packet)
-            if packet.haslayer(HTTPRequest):
-                self.check_for_sslstrip(packet)
-            if packet.haslayer(DHCP):
-                self.handle_dhcp_packet(packet)
+            src_ip, dst_ip = None, None
+            try:
+                if packet.haslayer(IP):
+                    src_ip = packet[IP].src
+                    dst_ip = packet[IP].dst
+                elif packet.haslayer(IPv6):
+                    src_ip = packet[IPv6].src
+                    dst_ip = packet[IPv6].dst
+            except Exception:
+                pass
+            
+            if src_ip:
+                self._update_fingerprint(src_ip, packet)
+                
+            self.handle_tcp_traffic(packet, src_ip, dst_ip)
+        
+            try:
+                if packet.haslayer(ARP):
+                    self.handle_arp(packet)
+                if packet.haslayer(ICMPv6ND_RA) or packet.haslayer(ICMPv6ND_NA) or packet.haslayer(ICMPv6ND_NS):
+                    self.handle_ipv6_nd(packet)
+                if packet.haslayer(DNS):
+                    self.check_dns_query(packet)
+                    self.check_dns_response(packet)
+                if packet.haslayer(HTTPRequest):
+                    self.check_for_sslstrip(packet)
+                    self.check_for_credentials(packet)
+                    self.check_for_payload_keywords(packet)
+                if packet.haslayer(DHCP):
+                    self.handle_dhcp_packet(packet)
+            except Exception as e:
+                logging.debug(f"Error procesando paquete: {e}")
         except Exception as e:
             logging.debug(f"Error procesando paquete: {e}")
 
     # -------------------- UI --------------------
+    def _init_pagination(self):
+        """Inicializa el índice de página y listeners de teclado."""
+        self._page_index = 0
+        self._devices_per_page = 20
+
+        # Escuchar teclas
+        keyboard.add_hotkey("up", self._prev_page)
+        keyboard.add_hotkey("down", self._next_page)
+        keyboard.add_hotkey("page up", self._prev_page)
+        keyboard.add_hotkey("page down", self._next_page)
+
+    def _prev_page(self):
+        if not hasattr(self, "_page_index"):
+            self._page_index = 0
+        self._page_index = max(0, self._page_index - 1)
+
+    def _next_page(self):
+        devices = list(self.network_map.items())
+        total_pages = max(1, (len(devices) + self._devices_per_page - 1) // self._devices_per_page)
+        if not hasattr(self, "_page_index"):
+            self._page_index = 0
+        self._page_index = min(total_pages - 1, self._page_index + 1)
+    
+    def generate_network_diagram(self):
+        if not DIAGRAM_LIBS_INSTALLED:
+            logging.warning("Saltando la generación del diagrama de red. No se encontró `networkx` o `matplotlib`.")
+            return
+
+        G = nx.Graph()
+
+        router_ip = self.gateway_ip_v4
+        if router_ip and router_ip in self.network_map:
+            G.add_node(router_ip, type='router')
+        
+        for ip, info in self.network_map.items():
+            if ip != router_ip:
+                G.add_node(ip, type='device')
+                G.add_edge(router_ip, ip)
+
+        plt.style.use('mpl20')
+        fig, ax = plt.subplots(figsize=(14, 10))
+        
+        router_pos = {router_ip: (0, 0)} if router_ip in G else {}
+        device_nodes = [n for n in G.nodes if n != router_ip]
+        if device_nodes:
+            device_pos = nx.circular_layout(G.subgraph(device_nodes))
+            pos = {**router_pos, **device_pos}
+        else:
+            pos = router_pos
+
+        node_colors = ['#FF4500' if G.nodes[n]['type'] == 'router' else '#1E90FF' for n in G.nodes()]
+        node_sizes = [4500 if G.nodes[n]['type'] == 'router' else 3000 for n in G.nodes()]
+
+        nx.draw_networkx_nodes(G, pos, node_color=node_colors, node_size=node_sizes, ax=ax)
+
+        nx.draw_networkx_edges(G, pos, edge_color='#000', width=2.0, alpha=0.7, ax=ax)
+
+        labels = {
+            node: f"Router\n{node}" if G.nodes[node]['type'] == 'router' else f"{self.network_map[node]['mac']}\n{node}"
+            for node in G.nodes()
+        }
+        nx.draw_networkx_labels(G, pos, labels=labels, font_size=10, font_color="#000000", font_weight='bold', ax=ax)
+
+        ax.set_title("Network Map", fontsize=24, color='#FFFFFF', fontname='Arial', fontweight='bold')
+        ax.axis('off')
+        plt.tight_layout()
+        
+        # Save the diagram
+        self.image_path = "network_diagram.png"
+        plt.savefig(self.image_path, format="png", dpi=200)
+        plt.close()
+    
     def generate_layout(self):
         with self.ui_lock:
-            status_panel = Panel(
-                f"[bold white]Estado:[/] {'[bold green]Activo[/]' if self.active else '[bold red]Detenido[/]'}\n"
-                f"[bold white]Interfaz:[/] {self.interface}\n"
-                f"[bold white]Gateway IPv4:[/] {self.gateway_ip_v4} ({self.gateway_mac_v4})\n"
-                f"[bold white]Paquetes procesados:[/] {self.packet_count}",
-                title="Estado de Detección",
-                border_style="green"
+            # Paneles de la columna izquierda
+            left_panels = [
+                Panel(
+                    f"[bold white]Estado:[/] {'[bold green]Activo[/]' if self.active else '[bold red]Detenido[/]'}\n"
+                    f"[bold white]Interfaz:[/] {self.interface}\n"
+                    f"[bold white]Gateway IPv4:[/] {self.gateway_ip_v4} ({self.gateway_mac_v4})\n"
+                    f"[bold white]Paquetes procesados:[/] {self.packet_count}",
+                    title="Estado de Detección",
+                    border_style="green",
+                    width=100,
+                ),
+                self.generate_network_map_panel(width=100),
+                self.generate_tcp_panel(width=100),
+                self.generate_protocols_panel(width=100),
+                self.generate_unusual_dns_panel(width=100)
+            ]
+
+            # Paneles de la columna derecha
+            right_panels = [
+                self.generate_alerts_panel(width=120),
+                self.generate_packet_panel(width=120)
+            ]
+
+            return Columns(
+                [
+                    Group(*left_panels),
+                    Group(*right_panels)
+                ],
+                expand=True
             )
-            
-            network_map_table = Table(title="[b]Dispositivos de la Red[/b]", style="dim")
-            network_map_table.add_column("[b]IP[/b]")
-            network_map_table.add_column("[b]MAC[/b]")
-            network_map_table.add_column("[b]Estado[/b]")
-            network_map_table.add_column("[b]Puertos Abiertos[/b]")
-            
-            for ip, info in self.network_map.items():
-                status = "Router" if info.get('is_router') else "Device"
-                ports = ', '.join(map(str, sorted(list(self.open_ports.get(ip, set()))))) or "Escaneando..."
-                network_map_table.add_row(ip, info['mac'], status, ports)
-                
-            network_map_panel = Panel(
-                network_map_table,
-                title="[b]Mapa de la Red[/b]",
-                border_style="blue"
+
+    def generate_network_map_panel(self, width):
+        devices = list(self.network_map.items())
+        total_pages = max(1, (len(devices) + self._devices_per_page - 1) // self._devices_per_page)
+        start = self._page_index * self._devices_per_page
+        end = start + self._devices_per_page
+        current_devices = devices[start:end]
+
+        network_map_table = Table(
+            title=f"[b]Dispositivos de la Red (página {self._page_index+1}/{total_pages})[/b]",
+            style="dim",
+            padding=(0,0),
+            show_header=True,
+            width=95
+        )
+        network_map_table.add_column("[b]IP[/b]", justify="left", no_wrap=True)
+        network_map_table.add_column("[b]MAC[/b]", justify="left", no_wrap=True)
+        network_map_table.add_column("[b]Fabricante[/b]", justify="left", no_wrap=True)
+        network_map_table.add_column("[b]OS[/b]", justify="left", no_wrap=True)
+        network_map_table.add_column("[b]Estado[/b]", justify="left", no_wrap=True)
+        network_map_table.add_column("[b]Puertos[/b]", justify="left", no_wrap=True)
+
+        for ip, info in current_devices:
+            status = "Router" if info.get('is_router') else "Dispositivo"
+            ports = ','.join(map(str, sorted(list(self.open_ports.get(ip, set()))))) or "Escaneando..."
+            os_info = info.get('os_type', 'N/A')
+            manufacturer = info.get('manufacturer', 'N/A')
+            network_map_table.add_row(ip, info['mac'], manufacturer, os_info, status, ports)
+
+        return Panel(
+            network_map_table,
+            title="[b]Mapa de la Red[/b]",
+            border_style="blue",
+            width=width
+        )
+
+    def generate_tcp_panel(self, width):
+        tcp_table = Table(title="[b]Últimas Peticiones TCP[/b]", style="dim", padding=(0,0), width=95)
+        tcp_table.add_column("[b]Hora[/b]", justify="left", no_wrap=True)
+        tcp_table.add_column("[b]IP Origen[/b]", justify="left", no_wrap=True)
+        tcp_table.add_column("[b]Pto. Origen[/b]", justify="left", no_wrap=True)
+        tcp_table.add_column("[b]IP Destino[/b]", justify="left", no_wrap=True)
+        tcp_table.add_column("[b]Pto. Destino[/b]", justify="left", no_wrap=True)
+        tcp_table.add_column("[b]Flags[/b]", justify="left", no_wrap=True)
+
+        for req in self.tcp_requests:
+            tcp_table.add_row(
+                req['time'],
+                req['src_ip'],
+                str(req['src_port']),
+                req['dst_ip'],
+                str(req['dst_port']),
+                req['flags']
             )
-            
-            alerts_panel_content = ""
-            for timestamp, alert in self.alerts:
-                alerts_panel_content += f"[bold red]{timestamp}[/] - [bold yellow]{alert}[/]\n"
-            alerts_panel = Panel(alerts_panel_content, title="Alertas de Seguridad", border_style="red", height=6, width=150)
+        return Panel(tcp_table, title="[b]Trafico TCP[/b]", border_style="magenta", width=width)
 
-            left_group = Group(status_panel, network_map_panel)
+    def generate_protocols_panel(self, width):
+        protocols_table = Table(
+            title="[b]Protocolos Detectados[/b]",
+            style="dim",
+            padding=(0,0),
+            width=95
+        )
+        protocols_table.add_column("[b]Hora[/b]", justify="left", no_wrap=True)
+        protocols_table.add_column("[b]Protocolo[/b]", justify="left", no_wrap=True)
+        protocols_table.add_column("[b]IP Origen[/b]", justify="left", no_wrap=True)
+        protocols_table.add_column("[b]Pto. Destino[/b]", justify="left", no_wrap=True)
+        
+        for req in self.tcp_requests:
+            protocols_table.add_row(
+                req['time'],
+                req['protocol'],
+                req['src_ip'],
+                str(req['dst_port'])
+            )
+        return Panel(protocols_table, title="[b]Protocolos Detectados[/b]", border_style="cyan", width=width)
 
-            if self.recent_malicious_packet:
-                packet_dump = self.recent_malicious_packet.show2(dump=True)
-                syntax = Syntax(packet_dump, "go", theme="monokai", line_numbers=False)
-                packet_panel = Panel(syntax, title="Detalles del Paquete Malicioso", height=60, width=150)
-                
-                right_group = Group(alerts_panel, packet_panel)
-            else:
-                right_group = Group(alerts_panel)
+    def generate_alerts_panel(self, width):
+        alerts_panel_content = ""
+        recent_alerts = self.alerts[-3:] 
+        for timestamp, alert in recent_alerts:
+            alerts_panel_content += f"[bold red]{timestamp}[/] - [bold yellow]{alert}[/]\n"
+        return Panel(
+            alerts_panel_content,
+            title="Alertas de Seguridad",
+            border_style="red",
+            width=width
+        )
+    
+    def generate_unusual_dns_panel(self, width):
+        """Genera un panel que muestra búsquedas de DNS inusuales."""
+        table = Table(title="[b]Búsquedas DNS Inusuales[/b]", style="dim", padding=(0,0), width=95)
+        table.add_column("[b]Hora[/b]", justify="left", no_wrap=True)
+        table.add_column("[b]Origen[/b]", justify="left", no_wrap=True)
+        table.add_column("[b]Dominio[/b]", justify="left", no_wrap=True)
 
-        return Columns([left_group, right_group])
+        unusual_queries_copy = self.unusual_dns_queries.copy()
+
+        for time_str, src_ip, domain in unusual_queries_copy:
+            table.add_row(time_str, src_ip, domain)
+        
+        return Panel(
+            table,
+            title="[b]Búsquedas DNS Inusuales[/b]",
+            border_style="purple",
+            width=width
+        )
+
+    def generate_packet_panel(self, width):
+        if self.recent_malicious_packet:
+            packet_dump = self.recent_malicious_packet.show2(dump=True)
+            syntax = Syntax(packet_dump, "go", theme="monokai", line_numbers=True)
+            return Panel(syntax, title="Detalles del Paquete Malicioso", width=width, height=65)
+        else:
+            return Panel("[bold dim]Esperando paquetes...[/]", title="Detalles del Paquete Malicioso", border_style="dim", width=width, height=65)
 
     def start_ui(self):
         if self.log_only:
@@ -628,6 +1065,7 @@ class MitMDetection:
                 t.join(timeout=2)
 
     def stop(self):
+        self.generate_network_diagram()
         self.active = False
         self.stop_event.set()
 
@@ -663,7 +1101,6 @@ def main(argv: Optional[List[str]] = None):
         log_level=args.log_level,
     )
     detector.run()
-
 
 if __name__ == '__main__':
     main()
