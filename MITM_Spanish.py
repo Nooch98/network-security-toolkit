@@ -796,7 +796,7 @@ class MitMDetection:
     def _init_pagination(self):
         """Inicializa el índice de página y listeners de teclado."""
         self._page_index = 0
-        self._devices_per_page = 20
+        self._devices_per_page = 10
 
         # Escuchar teclas
         keyboard.add_hotkey("up", self._prev_page)
