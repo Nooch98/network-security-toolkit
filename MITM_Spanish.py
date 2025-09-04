@@ -799,10 +799,8 @@ class MitMDetection:
         self._devices_per_page = 10
 
         # Escuchar teclas
-        keyboard.add_hotkey("up", self._prev_page)
-        keyboard.add_hotkey("down", self._next_page)
-        keyboard.add_hotkey("page up", self._prev_page)
-        keyboard.add_hotkey("page down", self._next_page)
+        keyboard.add_hotkey("f2", self._prev_page)
+        keyboard.add_hotkey("f3", self._next_page)
 
     def _prev_page(self):
         if not hasattr(self, "_page_index"):
