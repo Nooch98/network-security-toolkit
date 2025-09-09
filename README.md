@@ -17,7 +17,7 @@ MITMGuard is available in **English and Spanish**, selectable at runtime.
 - ✅ Detects rogue gateways and multiple router announcements  
 - ✅ Flood/DoS anomaly detection  
 - ✅ Device fingerprinting (TTL, TCP window, DHCP client ID, HTTP UA)  
-- ✅ Optional countermeasures (ARP/ND corrections, attacker isolation via firewall rules)  
+- ✅ Optional countermeasures
 - ✅ JSONL export of alerts for SIEM/analysis  
 - ✅ Rich TUI (interactive interface with filters and pagination)  
 - ✅ Dual language support (English / Spanish)  
