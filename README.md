@@ -30,7 +30,7 @@ MITMGuard is available in **English and Spanish**, selectable at runtime.
 - Python 3.13+  
 - Dependencies:  
   ```bash
-  pip install scapy rich dnspython colorama keyboard
+  pip install -r .\requirements.txt
   ```
 
 ### Build as executable (Optional)
