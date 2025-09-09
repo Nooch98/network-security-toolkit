@@ -11,7 +11,7 @@ import io
 import socket
 import keyboard
 import requests
-from typing import Dict, List, Optional, Set, Tuple, Union
+from typing import Dict, List, Optional, Set, Tuple, Union, Any
 
 from colorama import init as colorama_init
 from rich.console import Console, Group
@@ -68,6 +68,20 @@ COMMON_PORTS = {
     3389: "RDP"
 }
 
+if getattr(sys, 'frozen', False):
+    BASE_DIR = os.path.dirname(sys.executable)
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+log_path = os.path.join(BASE_DIR, "mitm_debug.log")
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(log_path),
+    ]
+)
 
 class DNSCache:
     """Caché simple para consultas A usando resolvers especificados."""
@@ -149,6 +163,7 @@ class MitMDetection:
         self.console = Console()
         self.alerts: List[Tuple[str, str]] = []
         self.packet_count = 0
+        self.graph_packet_count = 0
         self.ui_lock = threading.Lock()
         self.recent_malicious_packet = None
         self._devices_per_page = 10
@@ -162,6 +177,29 @@ class MitMDetection:
         self._load_local_oui_database()
         self.get_manufacturer_by_mac = self.get_manufacturer_by_mac
         self.unusual_dns_queries: List[Tuple[str, str, str]] = []
+        self.dhcp_requests = {}
+        self.dhcp_request_threshold = 20
+        self.dhcp_check_interval = 1
+        self.packet_history = []
+        self.history_size = 5
+        self.last_packet_check = time.time()
+        self.ip_to_domain_map: Dict[str, str] = {}
+        self.tracker_domains: List[str] = self._load_tracker_domains()
+        self.tracking_attempts: List[Dict[str, Any]] = []
+        self.json_out_file = json_out
+        self.jsonl_lock = threading.Lock()
+        
+        if self.json_out:
+            json_path = self.json_out
+            if not os.path.isabs(json_path):
+                json_path = os.path.join(BASE_DIR, os.path.basename(self.json_out))
+                
+            try:
+                with open(json_path, 'w', encoding="utf-8") as f:
+                    f.truncate(0)
+                logging.debug(f"Archivo JSONL {json_path} vaciado al inicio")
+            except Exception as e:
+                logging.error(f"Error al vaciar el archivo JSONL {json_path}: {e}")
 
         try:
             self.my_ip = get_if_addr(self.interface)
@@ -218,28 +256,45 @@ class MitMDetection:
 
     def _setup_logging(self, level: str):
         lvl = getattr(logging, (level or 'INFO').upper(), logging.INFO)
+        logging_path = os.path.join(BASE_DIR, "mitm_detector.log")
         logging.basicConfig(
             level=lvl,
             format='%(message)s',
             datefmt='[%X]',
             handlers=[
-                logging.FileHandler('mitm_detector.log', mode='a'),
+                logging.FileHandler(logging_path, mode='a'),
             ],
         )
+        
+    def _load_tracker_domains(self) -> List[str]:
+        """Carga una lista de dominios de rastreadores desde un archivo."""
+        tracker_file = os.path.join(BASE_DIR, "tracker_domains.txt")
+        if os.path.exists(tracker_file):
+            with open(tracker_file, 'r') as f:
+                domains = [line.strip() for line in f if line.strip() and not line.startswith('#')]
+            self.console.print(f"[bold blue]Cargados {len(domains)} dominios de rastreo conocidos.[/bold blue]")
+            return domains
+        else:
+            self.console.print(f"[bold yellow]Advertencia: No se encontró el archivo '{tracker_file}'. La detección de rastreadores no estará activa.[/bold yellow]")
+            return []
 
     # -------------------- logging & alerts --------------------
     def _write_json_event(self, payload: dict):
         if not self.json_out:
             return
         try:
-            with open(self.json_out, 'a', encoding='utf-8') as f:
+            out_path = self.json_out
+            if not os.path.isabs(out_path):
+                out_path = os.path.join(BASE_DIR, os.path.basename(self.json_out))
+                
+            with open(out_path, 'a', encoding='utf-8') as f:
                 f.write(json.dumps(payload, ensure_ascii=False) + "\n")
         except Exception as e:
             logging.error(f"Error escribiendo evento JSON: {e}")
 
     def log_malicious_packet(self, packet, alert_type: str):
         try:
-            filename = f"{alert_type.lower()}_alerts.pcap"
+            filename = os.path.join(BASE_DIR, f"{alert_type.lower()}_alerts.pcap")
             wrpcap(filename, packet, append=True)
             logging.critical(f"[*] Paquete malicioso guardado en '{filename}'.")
         except Exception as e:
@@ -265,6 +320,27 @@ class MitMDetection:
             self.recent_malicious_packet = packet
 
     # -------------------- descubrimiento --------------------
+    def _check_for_trackers(self, src_ip: str, dst_domain: str):
+        for tracker_domain in self.tracker_domains:
+            if tracker_domain in dst_domain: 
+                # Ahora añadimos un nuevo diccionario para cada intento detectado
+                # Podemos añadir un timestamp si queremos
+                attempt_info = {
+                    "src_ip": src_ip,
+                    "tracker_domain": tracker_domain,
+                    "full_dst_domain": dst_domain, # El dominio exacto al que se conectó
+                    "timestamp": time.time()
+                }
+                self.tracking_attempts.append(attempt_info)
+                
+                self.log_alert( # Esto genera el log y debería actualizar la UI
+                    "TRACKING_ATTEMPT", 
+                    f"Intento de Rastreo Detectado desde {src_ip}",
+                    f"Dispositivo {src_ip} conectado a dominio de rastreo: {dst_domain}"
+                )
+                self.console.print(f"[bold magenta]ALERTA TRACKER:[/bold magenta] {dst_domain} desde {src_ip}") 
+                return # Detener al encontrar el primer match para este paquete
+    
     def _update_fingerprint(self, ip: str, packet):
         fp = self.device_fp.setdefault(ip, {'ttls': set(), 'tcp_windows': set(), 'http_ua': set(), 'dhcp_client_ids': set()})
         try:
@@ -409,7 +485,8 @@ class MitMDetection:
     def _port_scan_worker(self):
         while self.active and not self.stop_event.is_set():
             if self.network_map:
-                for ip in self.network_map:
+                ips_to_scan = list(self.network_map.keys())
+                for ip in ips_to_scan:
                     if ip not in self.open_ports:
                         with self.ui_lock:
                             self.open_ports[ip] = set()
@@ -419,18 +496,28 @@ class MitMDetection:
 
     def _scan_ports(self, ip: str):
         ports_to_scan = [22, 25, 80, 139, 443, 445, 3389, 8080]
-        for port in ports_to_scan:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(0.5)
-            try:
-                if sock.connect_ex((ip, port)) == 0:
-                    with self.ui_lock:
-                        self.open_ports[ip].add(port)
-            except Exception as e:
-                logging.debug(f"Error en escaneo de puerto {ip}:{port}: {e}")
-            finally:
-                sock.close()
+        if ":" in ip:
+            socket_family = socket.AF_INET6
+            connect_tuple = (ip, 0, 0, 0)
+        else:
+            socket_family = socket.AF_INET
+            connect_tuple = (ip, 0)
 
+        for port in ports_to_scan:
+            with socket.socket(socket_family, socket.SOCK_STREAM) as sock:
+                sock.settimeout(0.5)
+                try:
+                    if socket_family == socket.AF_INET6:
+                        connect_tuple_ipv6 = (ip, port, 0, 0)
+                        if sock.connect_ex(connect_tuple_ipv6) == 0:
+                            with self.ui_lock:
+                                self.open_ports[ip].add(port)
+                    else:
+                        if sock.connect_ex((ip, port)) == 0:
+                            with self.ui_lock:
+                                self.open_ports[ip].add(port)
+                except Exception as e:
+                    logging.debug(f"Error en escaneo de puerto {ip}:{port}: {e}")
 
     # -------------------- test mode --------------------
     def test_dns_spoofing(self):
@@ -447,7 +534,7 @@ class MitMDetection:
         logging.info("[*] Prueba finalizada.")
         self.stop()
 
-    # -------------------- manejadores --------------------
+    # -------------------- manejadores --------------------    
     def handle_arp(self, packet):
         try:
             arp_op = packet[ARP].op
@@ -518,32 +605,58 @@ class MitMDetection:
             if packet.haslayer(DNS) and packet[DNS].qr == 0:
                 self.dns_queries[packet[DNS].id] = packet[DNS][DNSQR].qname
 
-            if packet.haslayer(DNS) and packet.getlayer(DNS).qr == 0:
-                dns_query = packet.getlayer(DNS).qd.qname.decode('utf-8')
-                src_ip = packet.getlayer(IP).src
-                
+                src_ip = "N/A"
+                if packet.haslayer(IP):
+                    src_ip = packet.getlayer(IP).src
+                else:
+                    logging.debug("DEBUG: Paquete DNS de consulta sin capa IP. src_ip será N/A.")
+
+                dns_query = ""
+                if packet.haslayer(DNS) and packet.getlayer(DNS).qd:
+                    try:
+                        dns_query = packet.getlayer(DNS).qd.qname.decode('utf-8').strip('.')
+                    except Exception as e:
+                        logging.warning(f"Error decodificando qname en DNS query: {e}")
+                        return
+                else:
+                    logging.debug("DEBUG: Paquete DNS de consulta sin qd o sin DNS layer esperado.")
+                    return
+
+                logging.debug(f"DEBUG: En check_dns_query - src_ip: {src_ip}, dns_query: {dns_query}, longitud: {len(dns_query)}")
+
                 is_unusual = False
                 unusual_reason = ""
 
+                # Check 1: Longitud del subdominio (parte principal)
                 parts = dns_query.split('.')
-                if len(parts[0]) > 30:
+                if parts and len(parts[0]) > 30:
                     is_unusual = True
                     unusual_reason = f"Subdominio inusualmente largo ({len(parts[0])} caracteres)"
+                    logging.debug(f"DEBUG: DNS Inusual - Longitud detectada: {dns_query}")
 
+                # Check 2: TLD sospechoso (si no es inusual por longitud)
                 if not is_unusual:
-                    tld = parts[-2] if len(parts) > 1 else ""
+                    tld = parts[-1] if len(parts) > 0 else ""
+                    if tld == "":
+                        tld = parts[-2] if len(parts) > 1 else ""
+                    
                     if tld in ["ru", "bit", "cc", "ga", "ml", "tk"]:
                         is_unusual = True
                         unusual_reason = f"TLD sospechoso: .{tld}"
+                        logging.debug(f"DEBUG: DNS Inusual - TLD sospechoso detectado: {dns_query}")
 
                 if is_unusual:
                     with self.ui_lock:
-                        self.unusual_dns_queries.append((time.strftime("%H:%M:%S"), src_ip, dns_query))
+                        alert_tuple = (time.strftime("%H:%M:%S"), src_ip, dns_query)
+                        self.unusual_dns_queries.append(alert_tuple)
+                        logging.debug(f"DEBUG: DNS Inusual Añadido a la lista: {alert_tuple}") # Log cuando se añade
+                        
+                        # Limita la lista si crece demasiado
                         if len(self.unusual_dns_queries) > 20:
                             self.unusual_dns_queries.pop(0)
 
         except Exception as e:
-            logging.debug(f"Error procesando paquete DNS: {e}")
+            logging.error(f"Error CRÍTICO en check_dns_query: {e}", exc_info=True)
 
     def check_dns_response(self, packet):
         try:
@@ -609,23 +722,72 @@ class MitMDetection:
                 self.dns_responses.pop(host, None)
         except Exception:
             pass
-
-    def handle_dhcp_packet(self, packet):
+    
+    def check_anomalous_packets(self, packet):
+        """Verifica el paquete en busca de anomalías que puedan indicar una inyección."""
         try:
-            if packet.haslayer(DHCP) and packet[DHCP].options:
-                opts = packet[DHCP].options
-                msg_type = next((v for k, v in opts if k == 'message-type'), None)
-                if msg_type == 2:
+            if packet.haslayer(Ether) and packet[Ether].src == packet[Ether].dst:
+                self.log_alert(
+                    "PACKET_INJECTION",
+                    "Paquete con MAC de origen y destino idénticas",
+                    f"MAC: {packet[Ether].src}",
+                    packet=packet,
+                    log_level=logging.CRITICAL
+                )
+            if packet.haslayer(Ether):
+                packet_len = len(packet)
+                if packet_len > 1518 or packet_len < 64:
+                    self.log_alert(
+                        "PACKET_INJECTION",
+                        "Paquete con tamaño inusual",
+                        f"Tamaño de paquete: {packet_len} bytes",
+                        packet=packet,
+                        log_level=logging.WARNING
+                    )
+
+        except Exception as e:
+            self.logger.error(f"Error en check_anomalous_packets: {e}")
+    
+    def handle_dhcp_packet(self, packet):
+        """Maneja paquetes DHCP y busca ataques de spoofing y starvation."""
+        try:
+            if packet.haslayer(DHCP):
+                opts = dict(packet[DHCP].options)
+                msg_type = opts.get('message-type')
+
+                if msg_type == 1:  # DHCP Discover
+                    # Lógica de Detección de DHCP Starvation
+                    mac_src = packet[Ether].src
+                    now = time.time()
+                    
+                    # Limpiar registros antiguos (más de 1 segundo)
+                    self.dhcp_requests[mac_src] = [
+                        t for t in self.dhcp_requests.get(mac_src, [])
+                        if now - t < self.dhcp_check_interval
+                    ]
+                    self.dhcp_requests.setdefault(mac_src, []).append(now)
+
+                    if len(self.dhcp_requests[mac_src]) > self.dhcp_request_threshold:
+                        self.log_alert(
+                            "DHCP_STARVATION",
+                            "Posible ataque de agotamiento de direcciones IP",
+                            f"La MAC {mac_src} está enviando demasiadas peticiones DHCP. Total: {len(self.dhcp_requests[mac_src])}",
+                            packet=packet,
+                            log_level=logging.WARNING
+                        )
+
+                elif msg_type == 2:  # DHCP Offer
                     src_ip = packet[IP].src if packet.haslayer(IP) else '0.0.0.0'
                     if src_ip != self.gateway_ip_v4 and src_ip not in self.trusted_ips:
                         self.log_alert(
                             "DHCP_SPOOFING",
                             "Servidor DHCP no autorizado detectado",
-                            f"IP servidor sospechoso: {src_ip}, MAC: {packet[Ether].src}",
+                            f"IP sospechosa: {src_ip}, MAC: {packet[Ether].src}",
                             packet=packet,
+                            log_level=logging.CRITICAL
                         )
-        except Exception:
-            pass
+        except Exception as e:
+            self.logger.error(f"Error en handle_dhcp_packet: {e}")
         
     def get_os_from_ttl(self, ttl: int) -> str:
         if ttl <= 64:
@@ -753,8 +915,20 @@ class MitMDetection:
             return "Desconocido"
     
     def handle_packet(self, packet):
+        if not self.active:
+            return
+
         with self.ui_lock:
             self.packet_count += 1
+            self.graph_packet_count += 1
+            now = time.time()
+            
+            if now - self.last_packet_check >= 1:
+                pps = self.graph_packet_count / (now - self.last_packet_check)
+                self.packet_history.append(pps)
+                self.packet_history = self.packet_history[-self.history_size:]
+                self.graph_packet_count = 0
+                self.last_packet_check = now
         
         try:
             src_ip, dst_ip = None, None
@@ -767,20 +941,47 @@ class MitMDetection:
                     dst_ip = packet[IPv6].dst
             except Exception:
                 pass
-            
+
+            if packet.haslayer(DNS):
+                self.check_dns_query(packet)
+                if packet.qr == 1: 
+                    for i in range(packet[DNS].ancount):
+                        try:
+                            dnsrr = packet[DNSRR][i]
+                            if dnsrr.type == 1:
+                                domain = dnsrr.rrname.decode('utf-8', errors='ignore').strip('.')
+                                ip_resolved = dnsrr.rdata
+                                self.ip_to_domain_map[str(ip_resolved)] = domain
+                        except IndexError:
+                            continue
+                        except Exception as e:
+                            logging.warning(f"Error procesando registro DNS en respuestas: {e}")
+
+            if src_ip and dst_ip and TCP in packet and (packet[TCP].dport == 80 or packet[TCP].dport == 443):
+                dst_domain = None
+                if packet[TCP].dport == 80 and Raw in packet:
+                    try:
+                        http_payload = packet[Raw].load.decode('utf-8', errors='ignore')
+                        host_lines = [line for line in http_payload.split('\n') if "Host:" in line]
+                        if host_lines:
+                            dst_domain = host_lines[0].split("Host:")[1].strip()
+                    except Exception as e:
+                        pass
+                if not dst_domain and str(dst_ip) in self.ip_to_domain_map:
+                    dst_domain = self.ip_to_domain_map[str(dst_ip)]
+                if dst_domain:
+                    self._check_for_trackers(src_ip, dst_domain)
+
             if src_ip:
                 self._update_fingerprint(src_ip, packet)
-                
             self.handle_tcp_traffic(packet, src_ip, dst_ip)
-        
-            try:
+
+            try: 
                 if packet.haslayer(ARP):
                     self.handle_arp(packet)
                 if packet.haslayer(ICMPv6ND_RA) or packet.haslayer(ICMPv6ND_NA) or packet.haslayer(ICMPv6ND_NS):
                     self.handle_ipv6_nd(packet)
-                if packet.haslayer(DNS):
-                    self.check_dns_query(packet)
-                    self.check_dns_response(packet)
+                self.check_dns_response(packet)
                 if packet.haslayer(HTTPRequest):
                     self.check_for_sslstrip(packet)
                     self.check_for_credentials(packet)
@@ -788,9 +989,10 @@ class MitMDetection:
                 if packet.haslayer(DHCP):
                     self.handle_dhcp_packet(packet)
             except Exception as e:
-                logging.debug(f"Error procesando paquete: {e}")
+                logging.debug(f"Error procesando paquete en sub-funciones (interno): {e}")
+
         except Exception as e:
-            logging.debug(f"Error procesando paquete: {e}")
+            logging.debug(f"Error general procesando paquete en handle_packet: {e}")
 
     # -------------------- UI --------------------
     def _init_pagination(self):
@@ -859,7 +1061,7 @@ class MitMDetection:
         plt.tight_layout()
         
         # Save the diagram
-        self.image_path = "network_diagram.png"
+        self.image_path = os.path.join(BASE_DIR,"network_diagram.png")
         plt.savefig(self.image_path, format="png", dpi=200)
         plt.close()
     
@@ -885,7 +1087,9 @@ class MitMDetection:
             # Paneles de la columna derecha
             right_panels = [
                 self.generate_alerts_panel(width=120),
-                self.generate_packet_panel(width=120)
+                self.generate_packet_panel(width=120),
+                self.generate_traffic_graph_panel(width=120),
+                self.generate_tracking_attempts_panel(width=120)
             ]
 
             return Columns(
@@ -984,22 +1188,43 @@ class MitMDetection:
             width=width
         )
     
-    def generate_unusual_dns_panel(self, width):
+    def generate_unusual_dns_panel(self, width: int) -> Panel:
         """Genera un panel que muestra búsquedas de DNS inusuales."""
-        table = Table(title="[b]Búsquedas DNS Inusuales[/b]", style="dim", padding=(0,0), width=95)
-        table.add_column("[b]Hora[/b]", justify="left", no_wrap=True)
-        table.add_column("[b]Origen[/b]", justify="left", no_wrap=True)
-        table.add_column("[b]Dominio[/b]", justify="left", no_wrap=True)
 
-        unusual_queries_copy = self.unusual_dns_queries.copy()
+        table_width = width - 4
 
-        for time_str, src_ip, domain in unusual_queries_copy:
-            table.add_row(time_str, src_ip, domain)
-        
+        table = Table(
+            title="[b]Búsquedas DNS Inusuales[/b]", 
+            style="dim", 
+            padding=(0,1),
+            width=table_width,
+            show_header=True,
+            header_style="bold green" 
+        )
+
+        table.add_column("[b]Hora[/b]", justify="left", no_wrap=True, width=10)
+        table.add_column("[b]Origen[/b]", justify="left", no_wrap=True, width=15)
+        table.add_column("[b]Dominio[/b]", justify="left", no_wrap=False, max_width=table_width - 10 - 15 - 4)
+
+        if not self.unusual_dns_queries:
+
+            table.add_row(
+                Text("", style="dim"),
+                Text("No se han detectado", style="dim"),
+                Text("búsquedas DNS inusuales...", style="dim")
+            )
+        else:
+            for time_str, src_ip, domain in self.unusual_dns_queries[-5:]:
+                display_domain = domain
+                if len(display_domain) > (table_width - 10 - 15 - 4): 
+                    display_domain = display_domain[:(table_width - 10 - 15 - 4 - 3)] + "..."
+                
+                table.add_row(time_str, src_ip, display_domain, style="yellow")
+
         return Panel(
             table,
             title="[b]Búsquedas DNS Inusuales[/b]",
-            border_style="purple",
+            border_style="yellow",
             width=width
         )
 
@@ -1007,9 +1232,67 @@ class MitMDetection:
         if self.recent_malicious_packet:
             packet_dump = self.recent_malicious_packet.show2(dump=True)
             syntax = Syntax(packet_dump, "go", theme="monokai", line_numbers=True)
-            return Panel(syntax, title="Detalles del Paquete Malicioso", width=width, height=65)
+            return Panel(syntax, title="Detalles del Paquete Malicioso", width=width, height=40)
         else:
-            return Panel("[bold dim]Esperando paquetes...[/]", title="Detalles del Paquete Malicioso", border_style="dim", width=width, height=65)
+            return Panel("[bold dim]Esperando paquetes...[/]", title="Detalles del Paquete Malicioso", border_style="dim", width=width, height=40)
+        
+    def generate_traffic_graph_panel(self, width: int):
+        """Genera un panel con un gráfico de tráfico de paquetes por segundo."""
+        if not self.packet_history:
+            return Panel(
+                Text("Esperando datos de tráfico...", justify="center"),
+                title="[b]Gráfico de Tráfico[/b]",
+                border_style="yellow",
+                width=width
+            )
+
+        max_pps = max(self.packet_history) if self.packet_history else 1
+        graph_data = [int((pps / max_pps) * (width - 10)) for pps in self.packet_history]
+
+        block_chars = " ▏▎▍▌▋▊▉█"
+
+        graph_text = Text()
+        for i, pps in enumerate(self.packet_history):
+            bar_len = graph_data[i]
+            bar_str = block_chars[-1] * bar_len
+            if bar_str == "" and pps > 0:
+                bar_str = block_chars[1]
+
+            graph_text.append(bar_str, style="blue")
+            graph_text.append(f" {pps:.2f} pps\n", style="dim")
+
+        return Panel(
+            graph_text,
+            title=f"[b]Tráfico de la Red (pps)[/b] - Max: {max_pps:.2f}",
+            border_style="yellow",
+            width=width
+        )
+        
+    def generate_tracking_attempts_panel(self, width: int) -> Panel:
+        """Genera un panel con los intentos de rastreo detectados, mostrando solo los 4 más recientes."""
+        content = []
+
+        if not self.tracking_attempts:
+            content.append(Text("No se han detectado intentos de rastreo...", style="dim"))
+        else:
+            for attempt in self.tracking_attempts[-4:]:
+                src_ip = attempt["src_ip"]
+                tracker_domain = attempt["tracker_domain"]
+                full_dst_domain = attempt["full_dst_domain"]
+                timestamp = time.strftime("%H:%M:%S", time.localtime(attempt["timestamp"]))
+
+                content.append(Text(f"[{timestamp}] Desde ", style="dim") + 
+                               Text(f"{src_ip}", style="bright_red") +
+                               Text(f" -> Rastreador: ", style="bright_white") +
+                               Text(f"{tracker_domain}", style="cyan") +
+                               Text(f" ({full_dst_domain})", style="dim"))
+        
+        return Panel(
+            Group(*content),
+            title="[b]Intentos de Rastreo Web[/b]",
+            border_style="magenta",
+            width=width
+        )
 
     def start_ui(self):
         if self.log_only:
@@ -1086,6 +1369,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[List[str]] = None):
     args = parse_args(argv)
+
     trusted_ips_list = [ip.strip() for ip in (args.trusted_ips.split(',') if args.trusted_ips else []) if ip.strip()]
     detector = MitMDetection(
         interface=args.interface,
