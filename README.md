@@ -19,7 +19,7 @@ MITMGuard is available in **English and Spanish**, selectable at runtime.
 - ✅ Device fingerprinting (TTL, TCP window, DHCP client ID, HTTP UA)  
 - ✅ Optional countermeasures
 - ✅ JSONL export of alerts for SIEM/analysis  
-- ✅ Rich TUI (interactive interface with filters and pagination)  
+- ✅ Rich TUI
 - ✅ Dual language support (English / Spanish)  
 
 ---
