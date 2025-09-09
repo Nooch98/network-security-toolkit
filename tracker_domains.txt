@@ -1,0 +1,16 @@
+google-analytics.com
+googlesyndication.com
+doubleclick.net
+facebook.com
+facebook.net
+analytics.google.com
+adservice.google.com
+criteo.com
+adnxs.com
+bing.com/ads
+yandex.ru/metrika
+hotjar.com
+segment.io
+mixpanel.com
+amplitude.com
+clarity.ms
