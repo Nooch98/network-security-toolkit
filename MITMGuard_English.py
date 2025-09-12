@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import argparse
 import json
 import logging
@@ -11,6 +9,8 @@ import io
 import socket
 import keyboard
 import requests
+import ssl
+import dns.resolver
 from typing import Dict, List, Optional, Set, Tuple, Union, Any
 
 from colorama import init as colorama_init
@@ -43,8 +43,8 @@ from scapy.layers.l2 import getmacbyip
 from scapy.layers.http import HTTPRequest
 from scapy.layers.dhcp import DHCP
 from scapy.layers.inet6 import ICMPv6ND_RA, ICMPv6ND_NA, ICMPv6ND_NS
+from __future__ import annotations
 
-import dns.resolver
 
 try:
     import networkx as nx
@@ -189,6 +189,10 @@ class MitMDetection:
         self.tracking_attempts: List[Dict[str, Any]] = []
         self.json_out_file = json_out
         self.jsonl_lock = threading.Lock()
+        self.dns_verify_cert = False
+        self.dns_verify_timeout = 2.0
+        self.dns_verify_maxips = 5
+        self._dns_verif_cache = {}
         
         if self.json_out:
             json_path = self.json_out
@@ -681,6 +685,62 @@ class MitMDetection:
 
         except Exception as e:
             logging.error(f"CRITICAL error in check_dns_query: {e}", exc_info=True)
+            
+    def _match_hostname(self, hostname: str, pattern: str) -> bool:
+        hostname = hostname.lower().rstrip('.')
+        pattern = pattern.lower().rstrip('.')
+        
+        if pattern == hostname:
+            return True
+        if pattern.startswith('*.'):
+            suffix = pattern[2:]
+            return hostname.endswith('.' + suffix)
+        return False
+    
+    def _is_ip_in_resolvers(self, domain: str, ip_list:List[str]) -> bool:
+        try:
+            valid_ips = self.dns_cache.resolve_a(domain)
+        except Exception:
+            valid_ips = set()
+        
+        if not valid_ips:
+            return False
+        
+        for ip in ip_list:
+            if ip in valid_ips:
+                return True
+        return False
+    
+    def _verify_cert_for_ip(self, ip: str, domain: str) -> bool:
+        key = (domain.lower(), ip)
+        if key in self.dns_verif_cache:
+            return bool(self._dns_verif_cache[key])
+        
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        
+        try:
+            with socket.create_connection((ip, 443), timeout=self.dns_verify_timeout) as sock:
+                with ctx.warp_socket(sock, server_hostname=domain) as ssock:
+                    cert = ssock.getpeercert()
+                    san = cert.get("subjectAltName", ())
+                    for typ, val in san:
+                        if typ.lower() in ('dns',) and self._match_hostname(domain, val):
+                            self._dns_verif_cache[key] = True
+                            return True
+                        
+                    subject = cert.get('subject', ())
+                    for part in subject:
+                        for k, v in part:
+                            if k.lower() == 'commonname' and self._match_hostname(domain, v):
+                                self._dns_verif_cache[key] = True
+                                return True
+        except Exception:
+            pass
+        
+        self._dns_verif_cache[key] = False
+        return False
 
     def check_dns_response(self, packet):
         try:
@@ -719,17 +779,39 @@ class MitMDetection:
                 return
 
             valid_ips = self.dns_cache.resolve_a(query_name)
-            is_spoofed = bool(valid_ips) and not any(ip in valid_ips for ip in packet_resolved_ips)
-
-            if is_spoofed:
-                self.log_alert(
-                    "DNS_SPOOFING",
-                    f"Invalid DNS A for '{query_name}'",
-                    f"Expected any of: {sorted(valid_ips)}; Received: {packet_resolved_ips}",
+            
+            if not valid_ips:
+                self.log_alert("DNS_INVERIFED", f"IPs could not be validated for: {query_name}", f"Received: {packet_resolved_ips}", packet=packet)
+                self.dns_responses[query_name] = set(packet_resolved_ips)
+                return
+            
+            if self.dns_verify_cert and len(packet_resolved_ips) <= self.dns_verify_maxips:
+                verified_any = False
+                for ip in packet_resolved_ips:
+                    try:
+                        if self._verify_cert_for_ip(ip, query_name):
+                            verified_any = True
+                            break
+                    except Exception:
+                        continue
+                if verified_any:
+                    self.dns_responses[query_name] = set(packet_resolved_ips)
+                    return
+                else:
+                    self.log_alert(
+                        "DNS_SPOOFING",
+                        f"Invalid DNS A for '{query_name}' (does not match resolvers and cert does not validate)",
+                        f"Expected any of: {sorted(valid_ips)}; Received: {packet_resolved_ips}",
+                        packet=packet,
+                    )
+                    self.dns_responses[query_name] = set(packet_resolved_ips)
+                    
+            self.log_alert("DNS_UNVERIFED",
+                    f"Unusual DNS response for {query_name}", f"Expected: {sorted(valid_ips)}; Received: {packet_resolved_ips}",
                     packet=packet,
-                )
-
+            )
             self.dns_responses[query_name] = set(packet_resolved_ips)
+            
         except Exception as e:
             logging.debug(f"DNS response check error: {e}")
 
@@ -1390,6 +1472,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument('--no-active-scan', action='store_true', help="Disable periodic active network discovery scans.")
     parser.add_argument('--log-only', action='store_true', help="Do not start the Rich Live UI; log to file/console only.")
     parser.add_argument('--log-level', default='INFO', choices=['DEBUG','INFO','WARNING','ERROR','CRITICAL'], help="Logging verbosity.")
+    parser.add_argument('--dns-verify-cert', action='store_true', help="Verify TLS certificates for unexpected DNS IPs.")
+    parser.add_argument('--dns-verify-timeout', type=float, default=2.0, help="Timeout (s) for DNS verification lookups.")
+    parser.add_argument('--dns-verify-maxips', type=int, default=5, help="Max IPs to verify per DNS response.")
     return parser.parse_args(argv)
 
 def main(argv: Optional[List[str]] = None):
