@@ -50,6 +50,9 @@ def parse_args():
     parser.add_argument('--log-level', default='INFO', choices=['DEBUG','INFO','WARNING','ERROR','CRITICAL'], help="Logging level.")
     parser.add_argument('-L', '--lang', default="en", choices=["en", "es"], help="Set language for messages (en, es).")
     parser.add_argument('-C', '--clean', action='store_true', help="Borra archivos generados (logs, pcaps, jsonl, diagramas) y sale")
+    parser.add_argument('--dns-verify-cert', action='store_true', help="Verify TLS certificates for unexpected DNS IPs.")
+    parser.add_argument('--dns-verify-timeout', type=float, default=2.0, help="Timeout (s) for DNS verification lookups.")
+    parser.add_argument('--dns-verify-maxips', type=int, default=5, help="Max IPs to verify per DNS response.")
     return parser.parse_args()
 
 def main():
@@ -108,6 +111,12 @@ def main():
             target_args.append("--log-only")
         if args.log_level:
             target_args.extend(["--log-level", args.log_level])
+        if args.dns_verify_cert:
+            target_args.append("--dns-verify-cert")
+        if args.dns_verify_timeout:
+            target_args.extend(["--dns-verify-timeout", str(args.dns_verify_timeout)])
+        if args.dns_verify_maxips:
+            target_args.extend(["--dns-verify-maxips", str(args.dns_verify_maxips)])
         original_sys_argv = sys.argv[:]
         sys.argv = ['_placeholder_script_name_'] + target_args
         
