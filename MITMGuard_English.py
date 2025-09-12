@@ -1,3 +1,4 @@
+from __future__ import annotations
 import argparse
 import json
 import logging
@@ -43,7 +44,6 @@ from scapy.layers.l2 import getmacbyip
 from scapy.layers.http import HTTPRequest
 from scapy.layers.dhcp import DHCP
 from scapy.layers.inet6 import ICMPv6ND_RA, ICMPv6ND_NA, ICMPv6ND_NS
-from __future__ import annotations
 
 
 try:
