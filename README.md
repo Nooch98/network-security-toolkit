@@ -36,7 +36,7 @@ MITMGuard is available in **English and Spanish**, selectable at runtime.
 
 ### Build as executable (Optional)
 ```bash
-pyinstaller --onefile --icon "logo.ico" --name MITMGuard .\MITMGuard.py --add-data "MITMGuard_Spanish.py;." --add-data "MITMGuard_English.py;." --add-data "logo.ico;." --hidden-import "keyboard" --hidden-import "requests" --hidden-import "colorama" --hidden-import "rich" --hidden-import "scapy" --hidden-import "matplotlib" --hidden-import "networkx" --hidden-import "scapy.all" --hidden-import "dnspython" --hidden-import "dns" --hidden-import "dns.resolver" --add-data "tracker_domains.txt;."
+pyinstaller --onefile --icon "logo.ico" --name MITMGuard .\MITMGuard.py --add-data "MITMGuard_Spanish.py;." --add-data "MITMGuard_English.py;." --add-data "logo.ico;." --hidden-import "keyboard" --hidden-import "requests" --hidden-import "colorama" --hidden-import "rich" --hidden-import "scapy" --hidden-import "matplotlib" --hidden-import "networkx" --hidden-import "scapy.all" --hidden-import "dnspython" --hidden-import "dns" --hidden-import "dns.resolver" --hidden-import "tkinter" --hidden-import "tkinter.ttk" --hidden-import "tkinter.messagebox" --hidden-import "tkinter.filedialog" --hidden-import "tkinter.scrolledtext" --add-data "tracker_domains.txt;."
 ```
 It is recommended to add to the path.
 
