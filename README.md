@@ -20,7 +20,8 @@ MITMGuard is available in **English and Spanish**, selectable at runtime.
 - ✅ Optional countermeasures
 - ✅ JSONL export of alerts for SIEM/analysis  
 - ✅ Rich TUI
-- ✅ Dual language support (English / Spanish)  
+- ✅ Dual language support (English / Spanish)
+- ✅ Interactive GUI for PCAP analysis  
 
 ---
 
@@ -60,6 +61,11 @@ python MITMGuard.py -i <interface> -p/--pasive
 ```PowerShell
 python MITMGuard.py -i <interface> -l es # Spanish
 python MITMGuard.py -i <interface> -l en # English
+```
+
+### Launch PCAP Viewer GUI
+```PowerShell
+python MITMGuard.py -i <interface> -g
 ```
 
 ### Clean generate files
