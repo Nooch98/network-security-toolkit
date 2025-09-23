@@ -1492,31 +1492,30 @@ class PcapViewerGUI:
     def __init__(self, root, base_dir: str):
         self.root = root
         self.base_dir = base_dir
-        self.root.title("MITMGuard - Pcap Viewer")
+        self.root.title("MITMGuard - Visor de PCAP")
         self.root.geometry("1200x800")
-        
-        # Opciones de configuración
+
         self.config_options = {
             "tshark_timeout": 120.0
         }
 
         self.current_pcap_file = None
-        # Variables para la funcionalidad de búsqueda
         self.search_index_proto = "1.0"
         self.search_index_hex = "1.0"
+        
+        self.detailed_packets_data = []
 
         self.create_widgets()
-        self.status_bar.config(text="Listo. Selecciona un archivo PCAP para empezar.")
+        self.status_bar.config(text="Listo. Seleccione un archivo PCAP para comenzar.")
 
     def create_widgets(self):
-        # Frame superior para el filtro y botones
         top_frame = tk.Frame(self.root)
         top_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
         
         open_button = tk.Button(top_frame, text="Abrir PCAP", command=self.on_file_select)
         open_button.pack(side=tk.LEFT, padx=(0, 5))
 
-        filter_label = tk.Label(top_frame, text="Filtro de visualización:")
+        filter_label = tk.Label(top_frame, text="Filtro de visualización (Wireshark):")
         filter_label.pack(side=tk.LEFT, padx=(5, 0))
 
         self.filter_entry = ttk.Entry(top_frame, width=30)
@@ -1525,7 +1524,6 @@ class PcapViewerGUI:
         apply_filter_button = tk.Button(top_frame, text="Aplicar Filtro", command=self.on_apply_filter)
         apply_filter_button.pack(side=tk.LEFT, padx=5)
 
-        # Controles de búsqueda
         search_label = tk.Label(top_frame, text="Buscar:")
         search_label.pack(side=tk.LEFT, padx=(15, 0))
 
@@ -1535,23 +1533,25 @@ class PcapViewerGUI:
         search_button = tk.Button(top_frame, text="Buscar", command=self.on_search)
         search_button.pack(side=tk.LEFT, padx=5)
 
-        # Panel para la lista de paquetes
+        export_button = tk.Button(top_frame, text="Exportar", command=self.on_export)
+        export_button.pack(side=tk.LEFT, padx=5)
+
         tree_frame = tk.Frame(self.root)
         tree_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        self.packet_tree = ttk.Treeview(tree_frame, columns=("No.", "Time", "Source", "Destination", "Protocol", "Info"), show="headings")
+        self.packet_tree = ttk.Treeview(tree_frame, columns=("No.", "Tiempo", "Origen", "Destino", "Protocolo", "Info"), show="headings")
         self.packet_tree.heading("No.", text="No.")
-        self.packet_tree.heading("Time", text="Hora")
-        self.packet_tree.heading("Source", text="Origen")
-        self.packet_tree.heading("Destination", text="Destino")
-        self.packet_tree.heading("Protocol", text="Protocolo")
+        self.packet_tree.heading("Tiempo", text="Tiempo")
+        self.packet_tree.heading("Origen", text="Origen")
+        self.packet_tree.heading("Destino", text="Destino")
+        self.packet_tree.heading("Protocolo", text="Protocolo")
         self.packet_tree.heading("Info", text="Información")
 
         self.packet_tree.column("No.", width=50, anchor=tk.W, stretch=False)
-        self.packet_tree.column("Time", width=120, anchor=tk.W, stretch=False)
-        self.packet_tree.column("Source", width=150, anchor=tk.W, stretch=False)
-        self.packet_tree.column("Destination", width=150, anchor=tk.W, stretch=False)
-        self.packet_tree.column("Protocol", width=80, anchor=tk.W, stretch=False)
+        self.packet_tree.column("Tiempo", width=120, anchor=tk.W, stretch=False)
+        self.packet_tree.column("Origen", width=150, anchor=tk.W, stretch=False)
+        self.packet_tree.column("Destino", width=150, anchor=tk.W, stretch=False)
+        self.packet_tree.column("Protocolo", width=80, anchor=tk.W, stretch=False)
         self.packet_tree.column("Info", width=500, anchor=tk.W, stretch=True)
 
         tree_scrollbar = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.packet_tree.yview)
@@ -1561,7 +1561,6 @@ class PcapViewerGUI:
 
         self.packet_tree.bind("<<TreeviewSelect>>", self.on_packet_select)
 
-        # Divisor horizontal para los paneles de detalle
         h_paned_window = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
         h_paned_window.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
@@ -1576,22 +1575,21 @@ class PcapViewerGUI:
         hex_frame = tk.Frame(h_paned_window, borderwidth=1, relief="sunken")
         h_paned_window.add(hex_frame, weight=1)
         
-        hex_label = tk.Label(hex_frame, text="Hex Dump (Contenido del Paquete)")
+        hex_label = tk.Label(hex_frame, text="Volcado Hexadecimal (Contenido del Paquete)")
         hex_label.pack(side=tk.TOP, fill=tk.X)
-        self.hex_dump_text = scrolledtext.ScrolledText(hex_frame, wrap=tk.WORD, state=tk.DISABLED)
+        self.hex_dump_text = scrolledtext.ScrolledText(hex_frame, wrap=tk.WORD, state=tk.DISABLED, font=("Consolas", 9))
         self.hex_dump_text.pack(fill=tk.BOTH, expand=True)
 
-        self.status_bar = tk.Label(self.root, text="Listo", bd=1, relief=tk.SUNKEN, anchor=tk.W)
+        self.status_bar = tk.Label(self.root, text="Listo", bd=1, relief=tk.SUNKEN, anchor=tk.W) # Barra de estado
         self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
 
-        # Configurar tags de color para la búsqueda
         self.proto_details_text.tag_configure("found", background="yellow", foreground="black")
         self.hex_dump_text.tag_configure("found", background="yellow", foreground="black")
 
     def on_file_select(self):
         file_path = filedialog.askopenfilename(
             initialdir=self.base_dir,
-            title="Selecciona un archivo PCAP",
+            title="Seleccionar un archivo PCAP",
             filetypes=(("Archivos PCAP", "*.pcap"), ("Todos los archivos", "*.*"))
         )
         if file_path:
@@ -1602,14 +1600,13 @@ class PcapViewerGUI:
         if self.current_pcap_file:
             self.load_packets(self.current_pcap_file, display_filter=self.filter_entry.get())
         else:
-            messagebox.showinfo("Error", "Por favor, abre un archivo PCAP primero.")
+            messagebox.showinfo("Error", "Por favor, abra un archivo PCAP primero.")
 
     def on_search(self):
         query = self.search_entry.get().strip()
         if not query:
             return
 
-        # Deshacer resaltados anteriores
         self.proto_details_text.tag_remove("found", "1.0", tk.END)
         self.hex_dump_text.tag_remove("found", "1.0", tk.END)
         self.search_index_proto = "1.0"
@@ -1617,7 +1614,6 @@ class PcapViewerGUI:
 
         found_in_proto = self._find_and_highlight(self.proto_details_text, query, self.search_index_proto)
         
-        # Si no se encuentra en el primer panel, busca en el segundo
         if not found_in_proto:
             self._find_and_highlight(self.hex_dump_text, query, self.search_index_hex)
 
@@ -1631,7 +1627,7 @@ class PcapViewerGUI:
         if found_index:
             end_index = f"{found_index}+{len(query)}c"
             text_widget.tag_add("found", found_index, end_index)
-            text_widget.see(found_index) # Desplazar la vista a la coincidencia
+            text_widget.see(found_index) 
             text_widget.config(state=tk.DISABLED)
             return True
         else:
@@ -1641,6 +1637,9 @@ class PcapViewerGUI:
 
     def clear_packet_display(self):
         self.packet_tree.delete(*self.packet_tree.get_children())
+        
+        self.detailed_packets_data = []
+
         self.proto_details_text.config(state=tk.NORMAL)
         self.proto_details_text.delete('1.0', tk.END)
         self.proto_details_text.config(state=tk.DISABLED)
@@ -1652,10 +1651,10 @@ class PcapViewerGUI:
 
     def load_packets(self, file_path: str, display_filter: str = ""):
         self.clear_packet_display()
-        self.status_bar.config(text=f"Cargando paquetes de '{os.path.basename(file_path)}' con filtro '{display_filter or 'ninguno'}'...")
+        self.status_bar.config(text=f"Cargando paquetes de '{os.path.basename(file_path)}' con filtro '{display_filter or 'ninguno'}'...") # Mensaje de carga de paquetes
         
-        # Inicialización de la variable para evitar UnboundLocalError
         packet_count = 0 
+        self.detailed_packets_data = []
 
         try:
             tshark_cmd = [
@@ -1663,6 +1662,8 @@ class PcapViewerGUI:
                 "-T", "fields",
                 "-e", "frame.number",
                 "-e", "frame.time_epoch",
+                "-e", "frame.len", 
+                "-e", "eth.src", "-e", "eth.dst", 
                 "-e", "ip.src", "-e", "ipv6.src",
                 "-e", "ip.dst", "-e", "ipv6.dst",
                 "-e", "tcp.srcport", "-e", "tcp.dstport",
@@ -1670,8 +1671,11 @@ class PcapViewerGUI:
                 "-e", "sctp.srcport", "-e", "sctp.dstport",
                 "-e", "frame.protocols",
                 "-e", "http.request.method", "-e", "http.request.uri",
+                "-e", "http.host", 
                 "-e", "dns.qry.name", "-e", "dns.resp.name",
+                "-e", "dns.resp.type", 
                 "-e", "arp.opcode", "-e", "arp.src.hw_mac", "-e", "arp.dst.hw_mac",
+                "-e", "arp.src.proto_ipv4",
                 "-E", "separator=,",
                 "-E", "header=n",
                 "-E", "occurrence=f"
@@ -1701,39 +1705,65 @@ class PcapViewerGUI:
             elif stderr:
                 print(f"Advertencias de tshark al cargar paquetes: {stderr}")
 
+            field_names = [
+                "frame_number", "frame_time_epoch", "frame_length",
+                "eth_src", "eth_dst", 
+                "ip_src", "ipv6_src", "ip_dst", "ipv6_dst",
+                "tcp_srcport", "tcp_dstport", "udp_srcport", "udp_dstport",
+                "sctp_srcport", "sctp_dstport", 
+                "frame_protocols",
+                "http_request_method", "http_request_uri", "http_host",
+                "dns_query_name", "dns_response_name", "dns_response_type", 
+                "arp_opcode", "arp_src_hw", "arp_dst_hw", "arp_src_proto_ipv4"
+            ]
+            
+            print(f"Número esperado de campos para el análisis: {len(field_names)}")
+
             for line in stdout.strip().split('\n'):
                 if not line: continue
                 try:
-                    parts = line.split(',')
-                    if len(parts) < 20: continue
+                    parts = [p.strip() for p in line.split(',')]
 
-                    frame_number = parts[0].strip()
-                    timestamp_epoch = float(parts[1].strip())
+                    while len(parts) < len(field_names):
+                        parts.append("")
+
+                    if len(parts) > len(field_names):
+                        parts = parts[:len(field_names)]
+                    
+                    packet_detail = dict(zip(field_names, parts))
+
+                    frame_number = packet_detail.get("frame_number", "")
+                    timestamp_epoch = float(packet_detail.get("frame_time_epoch", "0"))
                     dt_object = datetime.fromtimestamp(timestamp_epoch)
                     timestamp_formatted = dt_object.strftime("%H:%M:%S.%f")[:-3]
-                    src_ip = parts[2].strip() or parts[3].strip()
-                    dst_ip = parts[4].strip() or parts[5].strip()
-                    src_port = parts[6].strip() or parts[8].strip() or parts[10].strip() or ""
-                    dst_port = parts[7].strip() or parts[9].strip() or parts[11].strip() or ""
-                    protocols_raw = parts[12].strip()
-                    http_method = parts[13].strip()
-                    http_uri = parts[14].strip()
-                    dns_qry_name = parts[15].strip()
-                    dns_resp_name = parts[16].strip()
-                    arp_opcode = parts[17].strip()
-                    arp_src_hw = parts[18].strip()
-                    arp_dst_hw = parts[19].strip()
                     
-                    proto, info = "UNKNOWN", protocols_raw
+                    src_ip = packet_detail.get("ip_src", "") or packet_detail.get("ipv6_src", "")
+                    dst_ip = packet_detail.get("ip_dst", "") or packet_detail.get("ipv6_dst", "")
+                    src_port = packet_detail.get("tcp_srcport", "") or packet_detail.get("udp_srcport", "") or packet_detail.get("sctp_srcport", "") or ""
+                    dst_port = packet_detail.get("tcp_dstport", "") or packet_detail.get("udp_dstport", "") or packet_detail.get("sctp_dstport", "") or ""
+                    
+                    protocols_raw = packet_detail.get("frame_protocols", "")
 
-                    if "http" in protocols_raw or http_method:
-                        proto, info = "HTTP", f"{http_method} {http_uri}"
-                    elif "dns" in protocols_raw:
+                    http_method = packet_detail.get("http_request_method", "")
+                    http_uri = packet_detail.get("http_request_uri", "")
+                    http_host = packet_detail.get("http_host", "")
+                    dns_qry_name = packet_detail.get("dns_query_name", "")
+                    dns_resp_name = packet_detail.get("dns_response_name", "")
+                    arp_opcode = packet_detail.get("arp_opcode", "")
+                    arp_src_hw = packet_detail.get("arp_src_hw", "")
+                    arp_dst_hw = packet_detail.get("arp_dst_hw", "")
+                    arp_src_proto_ipv4 = packet_detail.get("arp_src_proto_ipv4", "")
+                    
+                    proto, info = "DESCONOCIDO", protocols_raw
+
+                    if http_method:
+                        proto, info = "HTTP", f"{http_method} {http_uri} (Host: {http_host})"
+                    elif dns_qry_name or dns_resp_name:
                         proto = "DNS"
-                        info = f"Query: {dns_qry_name}" if dns_qry_name else f"Response: {dns_resp_name}"
-                    elif "arp" in protocols_raw:
+                        info = f"Consulta: {dns_qry_name}" if dns_qry_name else f"Respuesta: {dns_resp_name}"
+                    elif arp_opcode:
                         proto = "ARP"
-                        info = f"¿Quién tiene {dst_ip}? Dile a {src_ip}" if arp_opcode == '1' else f"{src_ip} está en {arp_src_hw}"
+                        info = f"¿Quién tiene ? Díselo a {arp_src_proto_ipv4}" if arp_opcode == '1' else f"{arp_src_proto_ipv4} está en {arp_src_hw}"
                     elif "tcp" in protocols_raw:
                         proto = "TCP"
                         info = f"{src_ip}:{src_port} -> {dst_ip}:{dst_port}"
@@ -1741,37 +1771,96 @@ class PcapViewerGUI:
                         proto = "UDP"
                         info = f"{src_ip}:{src_port} -> {dst_ip}:{dst_port}"
                     elif "ip" in protocols_raw:
-                        proto = "IP"
-                    elif "ipv6" in protocols_raw:
-                        proto = "IPv6"
+                        proto = "IP" if packet_detail.get("ip_src") else "IPv6"
+                        info = f"{src_ip} -> {dst_ip}"
                     
                     self.packet_tree.insert("", "end", values=(frame_number, timestamp_formatted, src_ip, dst_ip, proto, info))
+                    self.detailed_packets_data.append(packet_detail) 
                     packet_count += 1
 
                 except (ValueError, IndexError) as e:
-                    print(f"Error de parsing en línea tshark: {e} - Línea: {line}")
+                    print(f"Error crítico de análisis en la línea de tshark: {e} - Línea: '{line}'")
                     continue
                     
         except FileNotFoundError:
-            messagebox.showerror("Error", "tshark no encontrado. Asegúrate de que Wireshark esté instalado y tshark en tu PATH.")
+            messagebox.showerror("Error", "tshark no encontrado. Asegúrese de que Wireshark esté instalado y tshark en su PATH.")
             self.status_bar.config(text="Error: tshark no encontrado.")
         except subprocess.TimeoutExpired:
             proc.kill()
             stdout, stderr = proc.communicate()
             messagebox.showerror("Error de tshark", "tshark tardó demasiado en responder y fue terminado.")
-            self.status_bar.config(text="Error: tshark expiró el tiempo de espera.")
+            self.status_bar.config(text="Error: tiempo de espera de tshark agotado.")
         except Exception as e:
             messagebox.showerror("Error", f"Ocurrió un error inesperado al cargar paquetes: {e}")
             self.status_bar.config(text="Error inesperado al cargar paquetes.")
         
-        self.status_bar.config(text=f"Cargados {packet_count} paquetes.")
+        self.status_bar.config(text=f"Se cargaron {packet_count} paquetes.")
 
+    def on_export(self):
+        if not self.detailed_packets_data:
+            messagebox.showinfo("Exportar", "No hay paquetes para exportar.")
+            return
+
+        file_path = filedialog.asksaveasfilename(
+            initialdir=self.base_dir,
+            title="Exportar Paquetes",
+            defaultextension=".jsonl",
+            filetypes=(
+                ("Archivos JSONL", "*.jsonl"),
+                ("Archivos CSV", "*.csv"),
+                ("Archivos de texto", "*.txt"),
+                ("Todos los archivos", "*.*")
+            )
+        )
+
+        if not file_path:
+            return
+
+        try:
+            if file_path.lower().endswith('.jsonl'):
+                self._export_to_jsonl(file_path, self.detailed_packets_data)
+            elif file_path.lower().endswith('.csv'):
+                columns = list(self.detailed_packets_data[0].keys()) if self.detailed_packets_data else []
+                self._export_to_csv(file_path, self.detailed_packets_data, columns)
+            elif file_path.lower().endswith('.txt'):
+                self._export_to_text(file_path, self.detailed_packets_data)
+            else:
+                messagebox.showerror("Error de Exportación", "Formato de archivo seleccionado no soportado.")
+                return
+
+            messagebox.showinfo("Exportación Exitosa", f"Paquetes exportados exitosamente a {os.path.basename(file_path)}")
+            self.status_bar.config(text=f"Exportado a {os.path.basename(file_path)}")
+
+        except Exception as e:
+            messagebox.showerror("Error de Exportación", f"Ocurrió un error durante la exportación: {e}")
+            self.status_bar.config(text="Fallo la exportación.")
+
+    def _export_to_csv(self, file_path, data, columns):
+        import csv
+        with open(file_path, 'w', newline='', encoding='utf-8') as f:
+            if not data: return
+            writer = csv.DictWriter(f, fieldnames=columns)
+            writer.writeheader()
+            writer.writerows(data)
+
+    def _export_to_jsonl(self, file_path, data):
+        import json
+        with open(file_path, 'w', encoding='utf-8') as f:
+            for item in data:
+                f.write(json.dumps(item) + '\n')
+
+    def _export_to_text(self, file_path, data):
+        import json
+        with open(file_path, 'w', encoding='utf-8') as f:
+            for item in data:
+                f.write(json.dumps(item, indent=2) + '\n---\n')
+    
     def on_packet_select(self, event):
         selected_item = self.packet_tree.focus()
         if not selected_item: return
         
         frame_number = self.packet_tree.item(selected_item, 'values')[0]
-        self.status_bar.config(text=f"Mostrando detalles del paquete {frame_number}...")
+        self.status_bar.config(text=f"Mostrando detalles para el paquete {frame_number}...")
         self.get_packet_details(self.current_pcap_file, frame_number)
 
     def get_packet_details(self, file_path, frame_number):
@@ -1779,6 +1868,8 @@ class PcapViewerGUI:
         self.hex_dump_text.config(state=tk.NORMAL)
         self.proto_details_text.delete('1.0', tk.END)
         self.hex_dump_text.delete('1.0', tk.END)
+        self.proto_details_text.tag_remove("found", "1.0", tk.END) 
+        self.hex_dump_text.tag_remove("found", "1.0", tk.END) 
         
         try:
             tshark_cmd = ["tshark", "-r", file_path, "-T", "text", "-V", "-x", "-Y", f"frame.number == {frame_number}"]
@@ -1798,32 +1889,40 @@ class PcapViewerGUI:
             stdout, stderr = proc.communicate(timeout=10)
             
             if proc.returncode != 0 and stderr:
-                messagebox.showerror("Error de tshark", f"No se pudieron obtener los detalles del paquete: {stderr}")
+                messagebox.showerror("Error de tshark", f"No se pudieron recuperar los detalles del paquete: {stderr}")
                 return
 
-            protocol_details = ""
-            hex_dump = ""
-            hex_section = False
-            
-            for line in stdout.splitlines():
-                if re.match(r"^0000", line):
-                    hex_section = True
-                
-                if hex_section:
-                    hex_dump += line + "\n"
-                else:
-                    protocol_details += line + "\n"
+            protocol_details = []
+            hex_dump = []
+            hex_section_started = False
+            hex_line_pattern = re.compile(r"^[0-9a-fA-F]{4}\s{1,}(?:[0-9a-fA-F]{2}\s{1,}){1,}")
 
-            self.proto_details_text.insert(tk.END, protocol_details.strip())
-            self.hex_dump_text.insert(tk.END, hex_dump.strip())
+            for line in stdout.splitlines():
+                if not line.strip():
+                    if hex_section_started:
+                        hex_dump.append(line)
+                    else:
+                        protocol_details.append(line)
+                    continue
+
+                if not hex_section_started and hex_line_pattern.match(line):
+                    hex_section_started = True
+                
+                if hex_section_started:
+                    hex_dump.append(line)
+                else:
+                    protocol_details.append(line)
+
+            self.proto_details_text.insert(tk.END, "\n".join(protocol_details).strip())
+            self.hex_dump_text.insert(tk.END, "\n".join(hex_dump).strip())
 
         except FileNotFoundError:
-            messagebox.showerror("Error", "tshark no encontrado. Asegúrate de que Wireshark esté instalado y tshark en tu PATH.")
+            messagebox.showerror("Error", "tshark no encontrado. Asegúrese de que Wireshark esté instalado y tshark en su PATH.")
         except subprocess.TimeoutExpired:
             proc.kill()
             stdout, stderr = proc.communicate()
             messagebox.showerror("Error de tshark", "tshark tardó demasiado en responder y fue terminado.")
-            self.status_bar.config(text="Error: tshark expiró el tiempo de espera.")
+            self.status_bar.config(text="Error: tiempo de espera de tshark agotado.")
         except Exception as e:
             messagebox.showerror("Error", f"Ocurrió un error inesperado al mostrar detalles: {e}")
             self.status_bar.config(text="Error inesperado al mostrar detalles.")
