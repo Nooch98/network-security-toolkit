@@ -1495,394 +1495,176 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 class PcapViewerGUI:
-    def __init__(self, master, base_dir: str):
-        self.master = master
+    def __init__(self, root, base_dir: str):
+        self.root = root
         self.base_dir = base_dir
-        self.master.title("MITMGuard - PCAP Viewer")
-        self.master.geometry("1400x900")
-        self.master.minsize(1000, 700)
-        self.master.configure(bg=COLORS['bg_primary'])
+        self.root.title("MITMGuard - Pcap Viewer")
+        self.root.geometry("1200x800")
         
-        self.icons = {}
-        self.selected_packet_id = None  # NEW: To store the ID of the selected packet
-        
-        # ... (The rest of the style and menu configuration remains the same)
-        self.style = ttk.Style()
-        self.style.theme_use('clam')
-        self.style.configure('.', font=('Segoe UI', 10), background=COLORS['bg_primary'], foreground=COLORS['text_color'])
-        self.style.configure('TFrame', background=COLORS['bg_primary'])
-        self.style.configure('TLabel', background=COLORS['bg_primary'], foreground=COLORS['text_color'])
-        self.style.configure('TLabelFrame', background=COLORS['bg_primary'], foreground=COLORS['text_color'], relief='flat', borderwidth=1, lightcolor=COLORS['border_color'], darkcolor=COLORS['border_color'])
-        self.style.configure('TLabelframe.Label', font=('Segoe UI', 11, 'bold'), foreground=COLORS['accent_color'])
-        self.style.configure('TButton', background=COLORS['button_bg'], foreground=COLORS['text_color'], font=('Segoe UI', 10, 'bold'), borderwidth=0, relief='flat')
-        self.style.map('TButton',
-            background=[('active', COLORS['accent_color']), ('!disabled', COLORS['button_bg'])],
-            foreground=[('active', 'white')]
-        )
-        self.style.configure('TEntry', fieldbackground='white', foreground=COLORS['text_color'], borderwidth=1, relief='solid')
-        self.style.configure("Treeview",
-            background="white",
-            foreground=COLORS['text_color'],
-            fieldbackground="white",
-            rowheight=25,
-            borderwidth=1,
-            relief='solid',
-            font=('Segoe UI', 9)
-        )
-        self.style.map('Treeview',
-            background=[('selected', COLORS['highlight_color'])]
-        )
-        self.style.configure("Treeview.Heading",
-            font=('Segoe UI', 10, 'bold'),
-            background=COLORS['bg_secondary'],
-            foreground=COLORS['text_color'],
-            relief='raised'
-        )
-        self.style.map("Treeview.Heading",
-            background=[('active', COLORS['border_color'])]
-        )
-
-        # ... (Menu bar, main frame, left panel remain the same)
-        menubar = tk.Menu(self.master, bg=COLORS['bg_secondary'], fg=COLORS['text_color'])
-        self.master.config(menu=menubar)
-
-        file_menu = tk.Menu(menubar, tearoff=0, bg=COLORS['bg_secondary'], fg=COLORS['text_color'])
-        menubar.add_cascade(label="File", menu=file_menu)
-        file_menu.add_command(label="Open PCAP...", command=self.open_external_pcap)
-        file_menu.add_command(label="Refresh List", command=self.load_pcap_files)
-        file_menu.add_separator()
-        file_menu.add_command(label="Exit", command=self.master.quit)
-
-        help_menu = tk.Menu(menubar, tearoff=0, bg=COLORS['bg_secondary'], fg=COLORS['text_color'])
-        menubar.add_cascade(label="Help", menu=help_menu)
-        help_menu.add_command(label="About", command=self.show_about_info)
-
-        # Main frame
-        self.main_frame = ttk.Frame(self.master, padding="10")
-        self.main_frame.pack(fill=tk.BOTH, expand=True)
-
-        # Left panel for files
-        self.left_panel = ttk.Frame(self.main_frame, width=250)
-        self.left_panel.pack(side=tk.LEFT, fill=tk.Y, padx=10, pady=5)
-        self.left_panel.grid_propagate(False)
-
-        self.files_panel = ttk.LabelFrame(self.left_panel, text="PCAP Files", padding="10")
-        self.files_panel.pack(fill=tk.BOTH, expand=True, pady=5)
-        
-        refresh_button = ttk.Button(self.files_panel, text=" Refresh", image=self.get_icon('refresh'), compound=tk.LEFT, command=self.load_pcap_files)
-        refresh_button.pack(fill=tk.X, pady=(0, 5))
-
-        self.file_listbox = tk.Listbox(
-            self.files_panel, 
-            height=20, 
-            font=('Segoe UI', 10),
-            bd=0, 
-            highlightthickness=0,
-            selectbackground=COLORS['highlight_color'],
-            selectforeground='white',
-            bg='white',
-            fg=COLORS['text_color']
-        )
-        self.file_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        self.file_listbox.bind("<<ListboxSelect>>", self.on_file_select)
-        
-        self.scrollbar_files = ttk.Scrollbar(self.files_panel, orient=tk.VERTICAL, command=self.file_listbox.yview)
-        self.scrollbar_files.pack(side=tk.RIGHT, fill=tk.Y)
-        self.file_listbox.config(yscrollcommand=self.scrollbar_files.set)
-
-        # Right panel for details and packets
-        self.right_panel = ttk.Frame(self.main_frame)
-        self.right_panel.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=10, pady=5)
-
-        # Filter field
-        self.filter_frame = ttk.Frame(self.right_panel)
-        self.filter_frame.pack(fill=tk.X, pady=(0, 5))
-        ttk.Label(self.filter_frame, text="Display Filter (tshark):", font=('Segoe UI', 10, 'bold')).pack(side=tk.LEFT, padx=(0,5))
-        self.filter_entry = ttk.Entry(self.filter_frame, width=50, font=('Segoe UI', 10))
-        self.filter_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0,5))
-        self.filter_entry.bind("<Return>", self.apply_filter)
-        self.filter_button = ttk.Button(self.filter_frame, text=" Apply", image=self.get_icon('filter'), compound=tk.LEFT, command=self.apply_filter)
-        self.filter_button.pack(side=tk.LEFT)
-        
-        # Packets table
-        self.packet_tree = ttk.Treeview(
-            self.right_panel,
-            columns=("num", "time", "src", "dst", "proto", "info"),
-            show="headings",
-            selectmode="browse"
-        )
-        self.packet_tree.heading("num", text="#", anchor=tk.E, command=lambda: self.sort_treeview("num", False))
-        self.packet_tree.heading("time", text="Time", anchor=tk.W, command=lambda: self.sort_treeview("time", False))
-        self.packet_tree.heading("src", text="Source", anchor=tk.W, command=lambda: self.sort_treeview("src", False))
-        self.packet_tree.heading("dst", text="Destination", anchor=tk.W, command=lambda: self.sort_treeview("dst", False))
-        self.packet_tree.heading("proto", text="Protocol", anchor=tk.W, command=lambda: self.sort_treeview("proto", False))
-        self.packet_tree.heading("info", text="Information", anchor=tk.W, command=lambda: self.sort_treeview("info", False))
-        self.packet_tree.column("num", width=60, minwidth=40, anchor=tk.E, stretch=tk.NO)
-        self.packet_tree.column("time", width=160, minwidth=120, anchor=tk.W, stretch=tk.NO)
-        self.packet_tree.column("src", width=180, minwidth=100, anchor=tk.W, stretch=tk.YES)
-        self.packet_tree.column("dst", width=180, minwidth=100, anchor=tk.W, stretch=tk.YES)
-        self.packet_tree.column("proto", width=100, minwidth=70, anchor=tk.W, stretch=tk.NO)
-        self.packet_tree.column("info", width=350, minwidth=150, anchor=tk.W, stretch=tk.YES)
-        self.packet_tree.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
-        
-        # Scrollbars for the table
-        scrollbar_packets_y = ttk.Scrollbar(self.packet_tree, orient=tk.VERTICAL, command=self.packet_tree.yview)
-        scrollbar_packets_y.pack(side=tk.RIGHT, fill=tk.Y)
-        self.packet_tree.config(yscrollcommand=scrollbar_packets_y.set)
-
-        scrollbar_packets_x = ttk.Scrollbar(self.packet_tree, orient=tk.HORIZONTAL, command=self.packet_tree.xview)
-        scrollbar_packets_x.pack(side=tk.BOTTOM, fill=tk.X)
-        self.packet_tree.config(xscrollcommand=scrollbar_packets_x.set)
-        
-        # Packet details panel (bottom part)
-        self.packet_info_notebook = ttk.Notebook(self.right_panel)
-        self.packet_info_notebook.pack(fill=tk.BOTH, expand=False, pady=(0, 5), ipady=5)
-
-        # Tab 1: Protocol Details (Text)
-        self.proto_details_frame = ttk.Frame(self.packet_info_notebook, style='TFrame')
-        self.packet_info_notebook.add(self.proto_details_frame, text="Protocol Details")
-        self.proto_details_text = scrolledtext.ScrolledText(self.proto_details_frame, height=12, state=tk.DISABLED, wrap=tk.WORD, font=('Consolas', 9), bg='white', fg=COLORS['text_color'])
-        self.proto_details_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        # BINDINGS TO PREVENT DESELECTION
-        self.proto_details_text.bind("<Button-1>", self.on_text_click)
-        self.proto_details_text.bind("<ButtonRelease-1>", self.on_text_release)  # NEW: To ensure focus
-        self.proto_details_text.bind("<B1-Motion>", self.on_text_drag)  # NEW: For drag selection
-        
-        # Tab 2: Hex Dump
-        self.hex_dump_frame = ttk.Frame(self.packet_info_notebook, style='TFrame')
-        self.packet_info_notebook.add(self.hex_dump_frame, text="Hex Dump")
-        self.hex_dump_text = scrolledtext.ScrolledText(self.hex_dump_frame, height=12, state=tk.DISABLED, wrap=tk.NONE, font=('Consolas', 9), bg='white', fg=COLORS['text_color'])
-        self.hex_dump_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        # BINDINGS TO PREVENT DESELECTION
-        self.hex_dump_text.bind("<Button-1>", self.on_text_click)
-        self.hex_dump_text.bind("<ButtonRelease-1>", self.on_text_release)  # NEW: To ensure focus
-        self.hex_dump_text.bind("<B1-Motion>", self.on_text_drag)  # NEW: For drag selection
-
-        # Tab 3: Packet Search
-        self.search_frame = ttk.Frame(self.packet_info_notebook)
-        self.packet_info_notebook.add(self.search_frame, text="Packet Search")
-        
-        self.search_input = ttk.Entry(self.search_frame, font=('Segoe UI', 10))
-        self.search_input.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5, pady=5)
-        self.search_input.bind('<Return>', self.search_packet_details)
-        
-        self.search_button = ttk.Button(self.search_frame, text="Search", command=self.search_packet_details)
-        self.search_button.pack(side=tk.LEFT, padx=5, pady=5)
-        
-        # --- Configure styles for search highlighting ---
-        self.proto_details_text.tag_configure("search_highlight", background="yellow", foreground="black")
-        self.hex_dump_text.tag_configure("search_highlight", background="yellow", foreground="black")
-        
-        # --- Status Bar ---
-        self.status_bar = ttk.Label(self.master, text="Ready.", relief=tk.SUNKEN, anchor=tk.W, font=('Segoe UI', 9), background=COLORS['bg_secondary'], foreground=COLORS['text_color'])
-        self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+        # Configuration options
+        self.config_options = {
+            "tshark_timeout": 120.0
+        }
 
         self.current_pcap_file = None
-        self.load_pcap_files()
+        # Variables for search functionality
+        self.search_index_proto = "1.0"
+        self.search_index_hex = "1.0"
+
+        self.create_widgets()
+        self.status_bar.config(text="Ready. Select a PCAP file to start.")
+
+    def create_widgets(self):
+        # Top frame for filter and buttons
+        top_frame = tk.Frame(self.root)
+        top_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
         
+        open_button = tk.Button(top_frame, text="Open PCAP", command=self.on_file_select)
+        open_button.pack(side=tk.LEFT, padx=(0, 5))
+
+        filter_label = tk.Label(top_frame, text="Display Filter (Wireshark):")
+        filter_label.pack(side=tk.LEFT, padx=(5, 0))
+
+        self.filter_entry = ttk.Entry(top_frame, width=30)
+        self.filter_entry.pack(side=tk.LEFT, padx=5)
+
+        apply_filter_button = tk.Button(top_frame, text="Apply Filter", command=self.on_apply_filter)
+        apply_filter_button.pack(side=tk.LEFT, padx=5)
+
+        # Search controls
+        search_label = tk.Label(top_frame, text="Search:")
+        search_label.pack(side=tk.LEFT, padx=(15, 0))
+
+        self.search_entry = ttk.Entry(top_frame, width=20)
+        self.search_entry.pack(side=tk.LEFT, padx=5)
+
+        search_button = tk.Button(top_frame, text="Search", command=self.on_search)
+        search_button.pack(side=tk.LEFT, padx=5)
+
+        # Panel for packet list
+        tree_frame = tk.Frame(self.root)
+        tree_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        self.packet_tree = ttk.Treeview(tree_frame, columns=("No.", "Time", "Source", "Destination", "Protocol", "Info"), show="headings")
+        self.packet_tree.heading("No.", text="No.")
+        self.packet_tree.heading("Time", text="Time")
+        self.packet_tree.heading("Source", text="Source")
+        self.packet_tree.heading("Destination", text="Destination")
+        self.packet_tree.heading("Protocol", text="Protocol")
+        self.packet_tree.heading("Info", text="Information")
+
+        self.packet_tree.column("No.", width=50, anchor=tk.W, stretch=False)
+        self.packet_tree.column("Time", width=120, anchor=tk.W, stretch=False)
+        self.packet_tree.column("Source", width=150, anchor=tk.W, stretch=False)
+        self.packet_tree.column("Destination", width=150, anchor=tk.W, stretch=False)
+        self.packet_tree.column("Protocol", width=80, anchor=tk.W, stretch=False)
+        self.packet_tree.column("Info", width=500, anchor=tk.W, stretch=True)
+
+        tree_scrollbar = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.packet_tree.yview)
+        self.packet_tree.configure(yscrollcommand=tree_scrollbar.set)
+        tree_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.packet_tree.pack(fill=tk.BOTH, expand=True)
+
         self.packet_tree.bind("<<TreeviewSelect>>", self.on_packet_select)
+
+        # Horizontal divider for detail panels
+        h_paned_window = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
+        h_paned_window.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        details_frame = tk.Frame(h_paned_window, borderwidth=1, relief="sunken")
+        h_paned_window.add(details_frame, weight=1)
         
-    def on_text_click(self, event):
-        event.widget.focus_set()
+        details_label = tk.Label(details_frame, text="Packet Details (Protocol)")
+        details_label.pack(side=tk.TOP, fill=tk.X)
+        self.proto_details_text = scrolledtext.ScrolledText(details_frame, wrap=tk.WORD, state=tk.DISABLED)
+        self.proto_details_text.pack(fill=tk.BOTH, expand=True)
 
-        if self.selected_packet_id:
-            self.master.after(50, lambda: self.restore_treeview_selection())
+        hex_frame = tk.Frame(h_paned_window, borderwidth=1, relief="sunken")
+        h_paned_window.add(hex_frame, weight=1)
+        
+        hex_label = tk.Label(hex_frame, text="Hex Dump (Packet Content)")
+        hex_label.pack(side=tk.TOP, fill=tk.X)
+        self.hex_dump_text = scrolledtext.ScrolledText(hex_frame, wrap=tk.WORD, state=tk.DISABLED)
+        self.hex_dump_text.pack(fill=tk.BOTH, expand=True)
 
-        return 'break'
+        self.status_bar = tk.Label(self.root, text="Ready", bd=1, relief=tk.SUNKEN, anchor=tk.W)
+        self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
 
-    def on_text_release(self, event):
-        event.widget.focus_set()
-        if self.selected_packet_id:
-            self.master.after(50, lambda: self.restore_treeview_selection())
-        return 'break'
+        self.proto_details_text.tag_configure("found", background="yellow", foreground="black")
+        self.hex_dump_text.tag_configure("found", background="yellow", foreground="black")
 
-    def on_text_drag(self, event):
-        event.widget.focus_set()
-        pass
-
-    def restore_treeview_selection(self):
-        if self.selected_packet_id and self.selected_packet_id not in self.packet_tree.selection():
-            self.packet_tree.selection_remove(self.packet_tree.selection())
-            self.packet_tree.selection_set(self.selected_packet_id)
-            self.packet_tree.focus(self.selected_packet_id)
-            gui_logger.debug(f"Restored packet selection: {self.selected_packet_id}")
-
-    def get_icon(self, name):
-        if name not in self.icons:
-            try:
-                icon_path = os.path.join(os.path.dirname(__file__), "icons", f"{name}.png")
-                if os.path.exists(icon_path):
-                    self.icons[name] = tk.PhotoImage(file=icon_path)
-                else:
-                    self.icons[name] = tk.PhotoImage(width=1, height=1)
-                    gui_logger.warning(f"Icon '{name}.png' not found in 'icons' directory. Using placeholder.")
-            except Exception as e:
-                gui_logger.error(f"Error loading icon {name}: {e}")
-                self.icons[name] = tk.PhotoImage(width=1, height=1)
-        return self.icons[name]
-
-    def open_external_pcap(self):
+    def on_file_select(self):
         file_path = filedialog.askopenfilename(
-            title="Open PCAP file",
-            filetypes=[("PCAP Files", "*.pcap"), ("All files", "*.*")]
+            initialdir=self.base_dir,
+            title="Select a PCAP file",
+            filetypes=(("PCAP Files", "*.pcap"), ("All files", "*.*"))
         )
         if file_path:
-            filename = os.path.basename(file_path)
-            if filename not in self.file_listbox.get(0, tk.END):
-                self.file_listbox.insert(tk.END, filename)
-            idx = self.file_listbox.get(0, tk.END).index(filename)
-            self.file_listbox.selection_clear(0, tk.END)
-            self.file_listbox.selection_set(idx)
-            self.file_listbox.event_generate("<<ListboxSelect>>")
-            self.status_bar.config(text=f"File '{filename}' loaded from external location.")
+            self.current_pcap_file = file_path
+            self.load_packets(file_path, display_filter=self.filter_entry.get())
 
-    def show_about_info(self):
-        messagebox.showinfo(
-            "About MITMGuard PCAP Viewer",
-            "MITMGuard - MitM Attack Detection and Mitigation Tool\n"
-            "Version: 1.1.0 (PCAP Viewer)\n"
-            "Developed by: Nooch98\n"
-            "The PCAP viewer uses tshark (part of Wireshark) to analyze capture files."
-        )
-
-    def load_pcap_files(self):
-        self.status_bar.config(text="Loading PCAP files...")
-        self.file_listbox.delete(0, tk.END)
-        pcap_files = sorted([f for f in os.listdir(self.base_dir) if f.endswith('.pcap')])
-        
-        if not pcap_files:
-            self.file_listbox.insert(tk.END, "No .pcap files found in " + self.base_dir)
-            self.file_listbox.config(state=tk.DISABLED)
-            self.status_bar.config(text="No .pcap files found.")
-            self.clear_packet_display()
-            return
-
-        self.file_listbox.config(state=tk.NORMAL)
-        for f in pcap_files:
-            self.file_listbox.insert(tk.END, f)
-        
-        if pcap_files:
-            self.file_listbox.selection_set(0)
-            self.file_listbox.event_generate("<<ListboxSelect>>")
-            self.status_bar.config(text=f"Loaded {len(pcap_files)} .pcap files.")
-
-    def on_file_select(self, event):
-        selection = self.file_listbox.curselection()
-        if not selection:
-            self.current_pcap_file = None
-            self.clear_packet_display()
-            self.status_bar.config(text="No PCAP file selected.")
-            return
-        
-        filename = self.file_listbox.get(selection[0])
-        if os.path.isabs(filename):
-            self.current_pcap_file = filename
-        else:
-            self.current_pcap_file = os.path.join(self.base_dir, filename)
-        
-        self.status_bar.config(text=f"Loading packets from '{os.path.basename(self.current_pcap_file)}'...")
-        self.load_packets(self.current_pcap_file, display_filter=self.filter_entry.get())
-        
-    def search_packet_details(self, event=None):
-        search_term = self.search_input.get().lower()
-        if not search_term:
-            messagebox.showwarning("Search", "Please enter a search term.")
-            self.clear_search_highlights()
-            return
-            
-        self.clear_search_highlights()
-        
-        found_matches = False
-        
-        # Search in the protocol details tab
-        found_matches |= self.highlight_matches(self.proto_details_text, search_term)
-        
-        # Search in the hex dump tab
-        found_matches |= self.highlight_matches(self.hex_dump_text, search_term)
-        
-        if not found_matches:
-            messagebox.showinfo("Search", f"No matches found for '{search_term}'.")
-            
-    def clear_search_highlights(self):
-        self.proto_details_text.tag_remove("search_highlight", "1.0", tk.END)
-        self.hex_dump_text.tag_remove("search_highlight", "1.0", tk.END)
-            
-    def highlight_matches(self, text_widget, search_term):
-        found = False
-        start_index = "1.0"
-        
-        while True:
-            # Search case-insensitively
-            start_index = text_widget.search(search_term, start_index, stopindex=tk.END, nocase=1)
-            
-            if not start_index:
-                break
-            
-            found = True
-            end_index = f"{start_index}+{len(search_term)}c"
-            
-            # Apply the highlight tag
-            text_widget.tag_add("search_highlight", start_index, end_index)
-            
-            # Move the start index for the next search
-            start_index = end_index
-            
-        return found
-    
-    def apply_filter(self, event=None):
+    def on_apply_filter(self):
         if self.current_pcap_file:
-            self.status_bar.config(text=f"Applying filter '{self.filter_entry.get()}' to '{os.path.basename(self.current_pcap_file)}'...")
             self.load_packets(self.current_pcap_file, display_filter=self.filter_entry.get())
         else:
-            messagebox.showwarning("Warning", "Please select a PCAP file first.")
-            self.status_bar.config(text="No PCAP file selected to filter.")
+            messagebox.showinfo("Error", "Please open a PCAP file first.")
 
-    def on_packet_select(self, event):
-        selected_item = self.packet_tree.selection()
-        if not selected_item:
-            self.selected_packet_id = None
-            self.clear_packet_details()
+    def on_search(self):
+        query = self.search_entry.get().strip()
+        if not query:
             return
+
+        self.proto_details_text.tag_remove("found", "1.0", tk.END)
+        self.hex_dump_text.tag_remove("found", "1.0", tk.END)
+        self.search_index_proto = "1.0"
+        self.search_index_hex = "1.0"
+
+        found_in_proto = self._find_and_highlight(self.proto_details_text, query, self.search_index_proto)
+
+        if not found_in_proto:
+            self._find_and_highlight(self.hex_dump_text, query, self.search_index_hex)
+
+    def _find_and_highlight(self, text_widget, query, start_index):
+        text_widget.config(state=tk.NORMAL)
+        text_widget.mark_set("matchStart", start_index)
         
-        self.selected_packet_id = selected_item[0]
-        packet_data = self.packet_tree.item(self.selected_packet_id, "values")
-        frame_number = packet_data[0] 
+        count_var = tk.StringVar()
+        found_index = text_widget.search(query, "matchStart", stopindex=tk.END, count=count_var)
         
-        if self.current_pcap_file:
-            self.status_bar.config(text=f"Displaying details for packet #{frame_number}...")
-            self.show_packet_details(self.current_pcap_file, frame_number)
+        if found_index:
+            end_index = f"{found_index}+{len(query)}c"
+            text_widget.tag_add("found", found_index, end_index)
+            text_widget.see(found_index)
+            text_widget.config(state=tk.DISABLED)
+            return True
         else:
-            self.clear_packet_details()
+            text_widget.config(state=tk.DISABLED)
+            messagebox.showinfo("Search", f"No matches found for '{query}'.")
+            return False
 
     def clear_packet_display(self):
-        for item in self.packet_tree.get_children():
-            self.packet_tree.delete(item)
-        self.clear_packet_details()
-        self.status_bar.config(text="Ready.")
-
-    def clear_packet_details(self):
+        self.packet_tree.delete(*self.packet_tree.get_children())
         self.proto_details_text.config(state=tk.NORMAL)
         self.proto_details_text.delete('1.0', tk.END)
         self.proto_details_text.config(state=tk.DISABLED)
-        
         self.hex_dump_text.config(state=tk.NORMAL)
         self.hex_dump_text.delete('1.0', tk.END)
         self.hex_dump_text.config(state=tk.DISABLED)
-        
-        self.packet_info_notebook.tab(0, text="Protocol Details")  # Reset tab title
-        self.packet_info_notebook.tab(1, text="Hex Dump")
+        self.proto_details_text.tag_remove("found", "1.0", tk.END)
+        self.hex_dump_text.tag_remove("found", "1.0", tk.END)
 
     def load_packets(self, file_path: str, display_filter: str = ""):
         self.clear_packet_display()
         self.status_bar.config(text=f"Loading packets from '{os.path.basename(file_path)}' with filter '{display_filter or 'none'}'...")
 
+        packet_count = 0 
+
         try:
-            # tshark fields: frame.number, frame.time, IP/IPv6 src/dst, TCP/UDP/SCTP ports, frame.protocols, http.request, dns.qry.name, dns.resp.name, arp.opcode, arp.hw.src, arp.proto.src
             tshark_cmd = [
                 "tshark", "-r", file_path,
                 "-T", "fields",
                 "-e", "frame.number",
-                "-e", "frame.time_epoch",  # Use epoch for better sorting, then format
+                "-e", "frame.time_epoch",
                 "-e", "ip.src", "-e", "ipv6.src",
                 "-e", "ip.dst", "-e", "ipv6.dst",
                 "-e", "tcp.srcport", "-e", "tcp.dstport",
@@ -1900,41 +1682,41 @@ class PcapViewerGUI:
             if display_filter:
                 tshark_cmd.extend(["-Y", display_filter])
 
-            gui_logger.debug(f"Executing tshark (load_packets): {' '.join(tshark_cmd)}")
+            subprocess_kwargs = {
+                'stdout': subprocess.PIPE,
+                'stderr': subprocess.PIPE,
+                'text': True,
+                'encoding': 'utf-8',
+                'errors': 'ignore'
+            }
+
+            if os.name == 'nt':
+                subprocess_kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
             
-            proc = subprocess.Popen(tshark_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='ignore', creationflags=subprocess.CREATE_NO_WINDOW)
-            stdout, stderr = proc.communicate(timeout=60)
+            proc = subprocess.Popen(tshark_cmd, **subprocess_kwargs)
+            stdout, stderr = proc.communicate(timeout=self.config_options["tshark_timeout"])
             
             if proc.returncode != 0 and stderr and not stdout:
                 messagebox.showerror("tshark Error", f"Invalid filter or error loading packets: {stderr}")
                 self.status_bar.config(text="Error loading packets.")
                 return
             elif stderr:
-                gui_logger.warning(f"tshark warnings when loading packets: {stderr}")
+                print(f"tshark warnings when loading packets: {stderr}")
 
-            packet_count = 0
             for line in stdout.strip().split('\n'):
-                if not line:
-                    continue
+                if not line: continue
                 try:
                     parts = line.split(',')
-                    
-                    if len(parts) < 20:
-                        gui_logger.debug(f"Incomplete tshark line (expected 20 fields): {len(parts)} fields -> {line}")
-                        continue
+                    if len(parts) < 20: continue
 
                     frame_number = parts[0].strip()
                     timestamp_epoch = float(parts[1].strip())
-
                     dt_object = datetime.fromtimestamp(timestamp_epoch)
                     timestamp_formatted = dt_object.strftime("%H:%M:%S.%f")[:-3]
-
                     src_ip = parts[2].strip() or parts[3].strip()
                     dst_ip = parts[4].strip() or parts[5].strip()
-
                     src_port = parts[6].strip() or parts[8].strip() or parts[10].strip() or ""
                     dst_port = parts[7].strip() or parts[9].strip() or parts[11].strip() or ""
-                    
                     protocols_raw = parts[12].strip()
                     http_method = parts[13].strip()
                     http_uri = parts[14].strip()
@@ -1943,56 +1725,37 @@ class PcapViewerGUI:
                     arp_opcode = parts[17].strip()
                     arp_src_hw = parts[18].strip()
                     arp_dst_hw = parts[19].strip()
-
-                    proto = "UNKNOWN"
-                    info = protocols_raw
-
-                    if "eth" in protocols_raw:
-                        proto = "ETH"
-                    if "ip" in protocols_raw or "ipv6" in protocols_raw:
-                        proto = "IP" if "ip" in protocols_raw else "IPv6"
-                    if "tcp" in protocols_raw:
-                        proto = "TCP"
-                    if "udp" in protocols_raw:
-                        proto = "UDP"
-                    if "arp" in protocols_raw:
-                        proto = "ARP"
-
-                    if http_method:
-                        proto = "HTTP"
-                        info = f"{http_method} {http_uri}"
-                    elif dns_qry_name:
-                        proto = "DNS"
-                        info = f"Query: {dns_qry_name}"
-                    elif dns_resp_name:
-                        proto = "DNS"
-                        info = f"Response: {dns_resp_name}"
-                    elif arp_opcode:
-                        proto = "ARP"
-                        if arp_opcode == '1':  # Request
-                            info = f"Who has {dst_ip}? Tell {src_ip}"
-                        elif arp_opcode == '2':  # Reply
-                            info = f"{src_ip} is at {arp_src_hw}"
-                        else:
-                            info = protocols_raw
-                    elif src_port and dst_port:
-                        info = f"{src_ip}:{src_port} -> {dst_ip}:{dst_port}"
-                    else:
-                        info = protocols_raw
                     
-                    # Final format for Src/Dst
-                    src_display = f"{src_ip}:{src_port}" if src_ip and src_port else src_ip
-                    dst_display = f"{dst_ip}:{dst_port}" if dst_ip and dst_port else dst_ip
+                    proto, info = "UNKNOWN", protocols_raw
 
-                    self.packet_tree.insert("", "end", values=(frame_number, timestamp_formatted, src_display, dst_display, proto, info))
+                    if "http" in protocols_raw or http_method:
+                        proto, info = "HTTP", f"{http_method} {http_uri}"
+                    elif "dns" in protocols_raw:
+                        proto = "DNS"
+                        info = f"Query: {dns_qry_name}" if dns_qry_name else f"Response: {dns_resp_name}"
+                    elif "arp" in protocols_raw:
+                        proto = "ARP"
+                        info = f"Who has {dst_ip}? Tell {src_ip}" if arp_opcode == '1' else f"{src_ip} is at {arp_src_hw}"
+                    elif "tcp" in protocols_raw:
+                        proto = "TCP"
+                        info = f"{src_ip}:{src_port} -> {dst_ip}:{dst_port}"
+                    elif "udp" in protocols_raw:
+                        proto = "UDP"
+                        info = f"{src_ip}:{src_port} -> {dst_ip}:{dst_port}"
+                    elif "ip" in protocols_raw:
+                        proto = "IP"
+                    elif "ipv6" in protocols_raw:
+                        proto = "IPv6"
+                    
+                    self.packet_tree.insert("", "end", values=(frame_number, timestamp_formatted, src_ip, dst_ip, proto, info))
                     packet_count += 1
 
                 except (ValueError, IndexError) as e:
-                    gui_logger.error(f"Parsing error or missing data in tshark line: {e} - Line: {line}")
+                    print(f"Parsing error in tshark line: {e} - Line: {line}")
                     continue
                     
         except FileNotFoundError:
-            messagebox.showerror("Error", "tshark not found. Please ensure that Wireshark is installed and tshark is in your PATH.")
+            messagebox.showerror("Error", "tshark not found. Please ensure Wireshark is installed and tshark is in your PATH.")
             self.status_bar.config(text="Error: tshark not found.")
         except subprocess.TimeoutExpired:
             proc.kill()
@@ -2005,64 +1768,61 @@ class PcapViewerGUI:
         
         self.status_bar.config(text=f"Loaded {packet_count} packets.")
 
+    def on_packet_select(self, event):
+        selected_item = self.packet_tree.focus()
+        if not selected_item: return
+        
+        frame_number = self.packet_tree.item(selected_item, 'values')[0]
+        self.status_bar.config(text=f"Displaying details for packet {frame_number}...")
+        self.get_packet_details(self.current_pcap_file, frame_number)
 
-    def show_packet_details(self, file_path: str, packet_number: str):
-        self.clear_packet_details()
-        self.clear_search_highlights()  # Clear highlights from the previous packet
-
+    def get_packet_details(self, file_path, frame_number):
+        self.proto_details_text.config(state=tk.NORMAL)
+        self.hex_dump_text.config(state=tk.NORMAL)
+        self.proto_details_text.delete('1.0', tk.END)
+        self.hex_dump_text.delete('1.0', tk.END)
+        self.proto_details_text.tag_remove("found", "1.0", tk.END)
+        self.hex_dump_text.tag_remove("found", "1.0", tk.END)
+        
         try:
-            tshark_cmd = [
-                "tshark", "-r", file_path,
-                "-Y", f"frame.number == {packet_number}",
-                "-x",  # Show hex dump
-                "-V"   # Verbose mode
-            ]
+            tshark_cmd = ["tshark", "-r", file_path, "-T", "text", "-V", "-x", "-Y", f"frame.number == {frame_number}"]
             
-            gui_logger.debug(f"Executing tshark (show_packet_details): {' '.join(tshark_cmd)}")
+            subprocess_kwargs = {
+                'stdout': subprocess.PIPE,
+                'stderr': subprocess.PIPE,
+                'text': True,
+                'encoding': 'utf-8',
+                'errors': 'ignore'
+            }
 
-            proc = subprocess.Popen(tshark_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='ignore', creationflags=subprocess.CREATE_NO_WINDOW)
-            stdout, stderr = proc.communicate(timeout=30)
+            if os.name == 'nt':
+                subprocess_kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
             
-            if proc.returncode != 0 and stderr and not stdout:
-                messagebox.showerror("tshark Error", f"Error getting packet details: {stderr}")
-                self.status_bar.config(text="Error showing packet details.")
+            proc = subprocess.Popen(tshark_cmd, **subprocess_kwargs)
+            stdout, stderr = proc.communicate(timeout=10)
+            
+            if proc.returncode != 0 and stderr:
+                messagebox.showerror("tshark Error", f"Could not retrieve packet details: {stderr}")
                 return
-            elif stderr:
-                gui_logger.warning(f"tshark warnings when getting details: {stderr}")
 
-            # Split the tshark output into protocol details and hex dump
-            protocol_details = []
-            hex_dump = []
-            in_hex_dump = False
-
+            protocol_details = ""
+            hex_dump = ""
+            hex_section = False
+            
             for line in stdout.splitlines():
-                if re.match(r'^\s*0x[0-9a-fA-F]{4}:', line):  # Hex line pattern
-                    in_hex_dump = True
+                if re.match(r"^(0000|[\da-fA-F]{4})", line) and not "  " in line:
+                    hex_section = True
                 
-                if in_hex_dump:
-                    hex_dump.append(line)
+                if hex_section:
+                    hex_dump += line + "\n"
                 else:
-                    protocol_details.append(line)
-            
-            # --- Update Tab 1: Protocol Details ---
-            self.proto_details_text.config(state=tk.NORMAL)
-            self.proto_details_text.delete('1.0', tk.END)
-            self.proto_details_text.insert(tk.END, "\n".join(protocol_details).strip())
-            self.proto_details_text.config(state=tk.DISABLED)
-            self.packet_info_notebook.tab(0, text=f"Pkt Details #{packet_number}")
+                    protocol_details += line + "\n"
 
-            # --- Update Tab 2: Hex Dump ---
-            self.hex_dump_text.config(state=tk.NORMAL)
-            self.hex_dump_text.delete('1.0', tk.END)
-            self.hex_dump_text.insert(tk.END, "\n".join(hex_dump).strip())
-            self.hex_dump_text.config(state=tk.DISABLED)
-            self.packet_info_notebook.tab(1, text=f"Pkt Hex #{packet_number}")
-            
-            self.status_bar.config(text=f"Details for packet #{packet_number} loaded.")
-            
+            self.proto_details_text.insert(tk.END, protocol_details.strip())
+            self.hex_dump_text.insert(tk.END, hex_dump.strip())
+
         except FileNotFoundError:
-            messagebox.showerror("Error", "tshark not found. Please ensure that Wireshark is installed and tshark is in your PATH.")
-            self.status_bar.config(text="Error: tshark not found.")
+            messagebox.showerror("Error", "tshark not found. Please ensure Wireshark is installed and tshark is in your PATH.")
         except subprocess.TimeoutExpired:
             proc.kill()
             stdout, stderr = proc.communicate()
