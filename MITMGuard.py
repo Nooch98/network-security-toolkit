@@ -8,7 +8,7 @@ if getattr(sys, 'frozen', False):
     BASE_DIR = os.path.dirname(sys.executable)
 else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-    
+
 def clean_generated_files(base_path: str):
     """Elimina archivos generados por la herramienta (logs, pcaps, jsonl, diagramas)."""
     targets = [
@@ -53,6 +53,8 @@ def parse_args():
     parser.add_argument('--dns-verify-cert', action='store_true', help="Verify TLS certificates for unexpected DNS IPs.")
     parser.add_argument('--dns-verify-timeout', type=float, default=2.0, help="Timeout (s) for DNS verification lookups.")
     parser.add_argument('--dns-verify-maxips', type=int, default=5, help="Max IPs to verify per DNS response.")
+    # AÑADIR ESTA LÍNEA
+    parser.add_argument('--gui', action='store_true', help="Lanza la interfaz gráfica de usuario (GUI).")
     return parser.parse_args()
 
 def main():
@@ -75,7 +77,6 @@ def main():
     try:
         base_path = sys._MEIPASS
     except AttributeError:
-
         base_path = os.path.dirname(os.path.abspath(__file__))
 
     full_script_path = os.path.join(base_path, script_to_run)
@@ -84,7 +85,6 @@ def main():
         sys.path.insert(0, base_path)
 
     try:
-
         module_name = script_to_run.replace('.py', '')
 
         import importlib.util
@@ -117,6 +117,9 @@ def main():
             target_args.extend(["--dns-verify-timeout", str(args.dns_verify_timeout)])
         if args.dns_verify_maxips:
             target_args.extend(["--dns-verify-maxips", str(args.dns_verify_maxips)])
+        # AÑADIR ESTA LÍNEA
+        if args.gui:
+            target_args.append("--gui")
         original_sys_argv = sys.argv[:]
         sys.argv = ['_placeholder_script_name_'] + target_args
         
