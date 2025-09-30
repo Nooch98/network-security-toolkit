@@ -15,7 +15,7 @@ import dns.resolver
 import subprocess
 import re
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog, scrolledtext
+from tkinter import ttk, messagebox, filedialog, scrolledtext, simpledialog
 from typing import Dict, List, Optional, Set, Tuple, Union, Any
 
 from datetime import datetime
@@ -41,7 +41,8 @@ from scapy.all import (
     conf,
     srp,
     wrpcap,
-    Raw
+    Raw,
+    rdpcap
 )
 from scapy.layers.dns import DNS, DNSQR, DNSRR
 from scapy.layers.inet import TCP, UDP
@@ -150,6 +151,49 @@ class DNSCache:
         self.cache[key] = (set(), now, 30)
         return set()
 
+class DeviceInventory:
+    def __init__(self, base_dir: str):
+        self.inventory_file = os.path.join(base_dir, "device_inventory.json")
+        # Estructura: { 'ip_o_mac': {'name': 'Router', 'trusted': True, 'risk_score': 0, 'last_seen': 1678886400} }
+        self.inventory: Dict[str, Dict[str, Any]] = {}
+        self._load_inventory()
+
+    def _load_inventory(self):
+        if os.path.exists(self.inventory_file):
+            try:
+                with open(self.inventory_file, 'r', encoding='utf-8') as f:
+                    self.inventory = json.load(f)
+            except Exception:
+                self.inventory = {}
+        
+    def save_inventory(self):
+        try:
+            os.makedirs(os.path.dirname(self.inventory_file), exist_ok=True)
+            with open(self.inventory_file, 'w', encoding='utf-8') as f:
+                json.dump(self.inventory, f, indent=4)
+        except Exception:
+            pass
+            
+    def get_device_info(self, key: str) -> Dict[str, Any]:
+        now = time.time()
+        info = self.inventory.setdefault(key, {
+            'name': key, 
+            'trusted': False, 
+            'risk_score': 0, 
+            'last_seen': now
+        })
+        info['last_seen'] = now
+        return info
+
+    def set_device_name(self, key: str, name: str):
+        self.get_device_info(key)['name'] = name
+        self.save_inventory()
+        
+    def update_risk_score(self, key: str, score_change: int):
+        info = self.get_device_info(key)
+        info['risk_score'] = max(0, info.get('risk_score', 0) + score_change)
+        self.save_inventory()
+        return info['risk_score']
 
 class MitMDetection:
     def __init__(
@@ -210,6 +254,9 @@ class MitMDetection:
         self.dns_verify_timeout = 2.0
         self.dns_verify_maxips = 5
         self._dns_verif_cache = {}
+        self.inventory_manager = DeviceInventory(BASE_DIR)
+        self.tcp_flow_tracking: Dict[Tuple, int] = {}
+        self.MAX_RISK_SCORE = 15
         
         if self.json_out:
             json_path = self.json_out
@@ -873,12 +920,10 @@ class MitMDetection:
                 opts = dict(packet[DHCP].options)
                 msg_type = opts.get('message-type')
 
-                if msg_type == 1:  # DHCP Discover
-                    # Lógica de Detección de DHCP Starvation
+                if msg_type == 1:
                     mac_src = packet[Ether].src
                     now = time.time()
-                    
-                    # Limpiar registros antiguos (más de 1 segundo)
+
                     self.dhcp_requests[mac_src] = [
                         t for t in self.dhcp_requests.get(mac_src, [])
                         if now - t < self.dhcp_check_interval
@@ -894,7 +939,7 @@ class MitMDetection:
                             log_level=logging.WARNING
                         )
 
-                elif msg_type == 2:  # DHCP Offer
+                elif msg_type == 2:
                     src_ip = packet[IP].src if packet.haslayer(IP) else '0.0.0.0'
                     if src_ip != self.gateway_ip_v4 and src_ip not in self.trusted_ips:
                         self.log_alert(
@@ -939,6 +984,64 @@ class MitMDetection:
                     )
         except Exception:
             pass
+        
+    def _check_sensitive_protocol_payload(self, packet):
+        if not (packet.haslayer(TCP) and packet.haslayer(Raw)):
+            return
+
+        tcp_layer = packet[TCP]
+        src_port = tcp_layer.sport
+        dst_port = tcp_layer.dport
+        raw_payload = packet[Raw].load.decode('utf-8', errors='ignore')
+
+        port = src_port if dst_port in [21, 23, 110] else dst_port
+        protocol = COMMON_PORTS.get(port)
+        
+        if protocol in ["FTP", "Telnet", "POP3", "IMAP"]:
+            credential_keywords = ["USER", "PASS", "LOGIN", "AUTH"]
+            
+            for keyword in credential_keywords:
+                if keyword in raw_payload.upper():
+                    src_ip = packet[IP].src
+                    dst_ip = packet[IP].dst
+                    
+                    self.log_alert(
+                        f"{protocol}_CREDENTIALS",
+                        f"Credenciales potenciales sin cifrar {protocol}",
+                        f"Fuente: {src_ip}:{src_port} -> {dst_ip}:{dst_port}. La carga útil contiene una palabra clave '{keyword}'.",
+                        packet=packet
+                    )
+                    new_score = self.inventory_manager.update_risk_score(src_ip, 3)
+                    if new_score >= self.MAX_RISK_SCORE:
+                        self.log_alert("RIESGO CRÍTICO", f"El dispositivo {src_ip} alcanzó la puntuación de riesgo máxima", f"Se detectó transmisión de credenciales y otra actividad sospechosa (Puntuación: {new_score})")
+                    return
+                
+    def _check_tcp_sequence_anomaly(self, packet):
+        if not (packet.haslayer(IP) and packet.haslayer(TCP)):
+            return
+            
+        ip_layer = packet[IP]
+        tcp_layer = packet[TCP]
+
+        flow_key = (ip_layer.src, ip_layer.dst, tcp_layer.sport, tcp_layer.dport)
+        current_seq = tcp_layer.seq
+
+        if flow_key in self.tcp_flow_tracking:
+            last_seq = self.tcp_flow_tracking[flow_key]
+
+            if current_seq > last_seq:
+                diff = current_seq - last_seq
+
+                if diff > 100000 and len(tcp_layer.payload) < 50:
+                    self.log_alert(
+                        "TCP_SEQ_ANOMALY",
+                        f"Salto de secuencia TCP extremo ({diff} bytes))",
+                        f"El host {ip_layer.src} envió una secuencia inesperada. Posible intento de secuestro de sesión.",
+                        packet=packet
+                    )
+                    self.inventory_manager.update_risk_score(ip_layer.src, 5)
+
+        self.tcp_flow_tracking[flow_key] = current_seq
     
     def handle_tcp_traffic(self, packet, src_ip, dst_ip):
         try:
@@ -1100,17 +1203,28 @@ class MitMDetection:
                 if packet.haslayer(ICMPv6ND_RA) or packet.haslayer(ICMPv6ND_NA) or packet.haslayer(ICMPv6ND_NS):
                     self.handle_ipv6_nd(packet)
                 self.check_dns_response(packet)
+                if packet.haslayer(IP):
+                    src_ip = packet[IP].src
+                    self._update_fingerprint(src_ip, packet)
+                    self._check_tcp_sequence_anomaly(packet)
+                    self.check_anomalous_packets(packet)
                 if packet.haslayer(HTTPRequest):
                     self.check_for_sslstrip(packet)
                     self.check_for_credentials(packet)
                     self.check_for_payload_keywords(packet)
+                self._check_sensitive_protocol_payload(packet)
                 if packet.haslayer(DHCP):
                     self.handle_dhcp_packet(packet)
+                if self.fingerprint_changed(src_ip):
+                    self.inventory_manager.update_risk_score(src_ip, 2)
+                    
+                score = self.inventory_manager.get_device_info(src_ip)['risk_score']
+                if score > 0:
+                    logging.info(f"[*] Dispositivo {src_ip} Puntuacion de riesgo: {score}")
             except Exception as e:
-                logging.debug(f"Error procesando paquete en sub-funciones (interno): {e}")
-
+                logging.debug(f"Error de procesamiento de paquetes: {e}")
         except Exception as e:
-            logging.debug(f"Error general procesando paquete en handle_packet: {e}")
+            logging.debug(f"Error de procesamiento de paquetes: {e}")
 
     # -------------------- UI --------------------
     def _init_pagination(self):
@@ -1492,66 +1606,104 @@ class PcapViewerGUI:
     def __init__(self, root, base_dir: str):
         self.root = root
         self.base_dir = base_dir
-        self.root.title("MITMGuard - Visor de PCAP")
-        self.root.geometry("1200x800")
+        self.root.title("MITMGuard - Visor PCAP y Análisis de Detección")
+        self.root.geometry("1400x900")
+
+        self.inventory_manager = DeviceInventory(self.base_dir) 
 
         self.config_options = {
             "tshark_timeout": 120.0
         }
 
         self.current_pcap_file = None
+        self.all_packets = []
+        self.filtered_packets = []
+        self.detailed_packets_data = []
+        
         self.search_index_proto = "1.0"
         self.search_index_hex = "1.0"
         
-        self.detailed_packets_data = []
-
         self.create_widgets()
-        self.status_bar.config(text="Listo. Seleccione un archivo PCAP para comenzar.")
+        self.status_bar.config(text="Listo. Selecciona un archivo PCAP para empezar.")
+        self.update_inventory_display()
 
     def create_widgets(self):
-        top_frame = tk.Frame(self.root)
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        packet_tab = self._create_packet_analysis_tab(self.notebook)
+        inventory_tab = self._create_inventory_tab(self.notebook)
+
+        self.notebook.add(packet_tab, text="🔍 Análisis de Paquetes")
+        self.notebook.add(inventory_tab, text="🚨 Inventario y Riesgo de Dispositivos")
+
+        self.status_bar = ttk.Label(self.root, text="Listo", relief=tk.SUNKEN, anchor=tk.W)
+        self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+
+        if hasattr(self, 'proto_details_text'):
+             self.proto_details_text.tag_configure("found", background="yellow", foreground="black")
+             self.hex_dump_text.tag_configure("found", background="yellow", foreground="black")
+
+    def _create_packet_analysis_tab(self, parent):
+        tab = tk.Frame(parent)
+
+        top_frame = tk.Frame(tab)
         top_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
         
-        open_button = tk.Button(top_frame, text="Abrir PCAP", command=self.on_file_select)
+        open_button = ttk.Button(top_frame, text="Abrir PCAP", command=self.on_file_select)
         open_button.pack(side=tk.LEFT, padx=(0, 5))
 
-        filter_label = tk.Label(top_frame, text="Filtro de visualización (Wireshark):")
+        filter_label = ttk.Label(top_frame, text="Filtro de Visualización (Wireshark):")
         filter_label.pack(side=tk.LEFT, padx=(5, 0))
 
         self.filter_entry = ttk.Entry(top_frame, width=30)
         self.filter_entry.pack(side=tk.LEFT, padx=5)
 
-        apply_filter_button = tk.Button(top_frame, text="Aplicar Filtro", command=self.on_apply_filter)
+        apply_filter_button = ttk.Button(top_frame, text="Aplicar Filtro", command=self.on_apply_filter)
         apply_filter_button.pack(side=tk.LEFT, padx=5)
+        
+        export_filtered_button = ttk.Button(
+            top_frame, 
+            text="💾 Guardar PCAP Filtrado", 
+            command=self.save_filtered_pcap
+        )
+        export_filtered_button.pack(side=tk.LEFT, padx=5)
 
-        search_label = tk.Label(top_frame, text="Buscar:")
+        flow_button = ttk.Button(
+            top_frame, 
+            text="🔗 Filtrar por Flujo", 
+            command=self.filter_by_flow
+        )
+        flow_button.pack(side=tk.LEFT, padx=5)
+
+        search_label = ttk.Label(top_frame, text="Buscar:")
         search_label.pack(side=tk.LEFT, padx=(15, 0))
 
         self.search_entry = ttk.Entry(top_frame, width=20)
         self.search_entry.pack(side=tk.LEFT, padx=5)
 
-        search_button = tk.Button(top_frame, text="Buscar", command=self.on_search)
+        search_button = ttk.Button(top_frame, text="Buscar", command=self.on_search)
         search_button.pack(side=tk.LEFT, padx=5)
 
-        export_button = tk.Button(top_frame, text="Exportar", command=self.on_export)
+        export_button = ttk.Button(top_frame, text="Exportar Datos", command=self.on_export)
         export_button.pack(side=tk.LEFT, padx=5)
 
-        tree_frame = tk.Frame(self.root)
+        tree_frame = tk.Frame(tab)
         tree_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        self.packet_tree = ttk.Treeview(tree_frame, columns=("No.", "Tiempo", "Origen", "Destino", "Protocolo", "Info"), show="headings")
+        self.packet_tree = ttk.Treeview(tree_frame, columns=("No.", "Time", "Source", "Destination", "Protocol", "Info"), show="headings")
         self.packet_tree.heading("No.", text="No.")
-        self.packet_tree.heading("Tiempo", text="Tiempo")
-        self.packet_tree.heading("Origen", text="Origen")
-        self.packet_tree.heading("Destino", text="Destino")
-        self.packet_tree.heading("Protocolo", text="Protocolo")
+        self.packet_tree.heading("Time", text="Tiempo")
+        self.packet_tree.heading("Source", text="Origen")
+        self.packet_tree.heading("Destination", text="Destino")
+        self.packet_tree.heading("Protocol", text="Protocolo")
         self.packet_tree.heading("Info", text="Información")
 
         self.packet_tree.column("No.", width=50, anchor=tk.W, stretch=False)
-        self.packet_tree.column("Tiempo", width=120, anchor=tk.W, stretch=False)
-        self.packet_tree.column("Origen", width=150, anchor=tk.W, stretch=False)
-        self.packet_tree.column("Destino", width=150, anchor=tk.W, stretch=False)
-        self.packet_tree.column("Protocolo", width=80, anchor=tk.W, stretch=False)
+        self.packet_tree.column("Time", width=120, anchor=tk.W, stretch=False)
+        self.packet_tree.column("Source", width=150, anchor=tk.W, stretch=False)
+        self.packet_tree.column("Destination", width=150, anchor=tk.W, stretch=False)
+        self.packet_tree.column("Protocol", width=80, anchor=tk.W, stretch=False)
         self.packet_tree.column("Info", width=500, anchor=tk.W, stretch=True)
 
         tree_scrollbar = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.packet_tree.yview)
@@ -1561,13 +1713,16 @@ class PcapViewerGUI:
 
         self.packet_tree.bind("<<TreeviewSelect>>", self.on_packet_select)
 
-        h_paned_window = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
+        self.packet_tree.tag_configure('high_risk_packet', background='#FF9999', foreground='black') 
+        self.packet_tree.tag_configure('medium_risk_packet', background='#FFCC99', foreground='black') 
+
+        h_paned_window = ttk.PanedWindow(tab, orient=tk.HORIZONTAL)
         h_paned_window.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
         details_frame = tk.Frame(h_paned_window, borderwidth=1, relief="sunken")
         h_paned_window.add(details_frame, weight=1)
         
-        details_label = tk.Label(details_frame, text="Detalles del Paquete (Protocolo)")
+        details_label = ttk.Label(details_frame, text="Detalles del Paquete (Protocolo)")
         details_label.pack(side=tk.TOP, fill=tk.X)
         self.proto_details_text = scrolledtext.ScrolledText(details_frame, wrap=tk.WORD, state=tk.DISABLED)
         self.proto_details_text.pack(fill=tk.BOTH, expand=True)
@@ -1575,33 +1730,273 @@ class PcapViewerGUI:
         hex_frame = tk.Frame(h_paned_window, borderwidth=1, relief="sunken")
         h_paned_window.add(hex_frame, weight=1)
         
-        hex_label = tk.Label(hex_frame, text="Volcado Hexadecimal (Contenido del Paquete)")
+        hex_label = ttk.Label(hex_frame, text="Volcado Hexadecimal (Contenido del Paquete)")
         hex_label.pack(side=tk.TOP, fill=tk.X)
         self.hex_dump_text = scrolledtext.ScrolledText(hex_frame, wrap=tk.WORD, state=tk.DISABLED, font=("Consolas", 9))
         self.hex_dump_text.pack(fill=tk.BOTH, expand=True)
 
-        self.status_bar = tk.Label(self.root, text="Listo", bd=1, relief=tk.SUNKEN, anchor=tk.W) # Barra de estado
-        self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+        return tab
 
-        self.proto_details_text.tag_configure("found", background="yellow", foreground="black")
-        self.hex_dump_text.tag_configure("found", background="yellow", foreground="black")
+    def _create_inventory_tab(self, parent):
+        tab = tk.Frame(parent)
+        
+        tree_frame = tk.Frame(tab)
+        tree_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        self.device_tree = ttk.Treeview(tree_frame, 
+            columns=("Key", "Name", "RiskScore", "Trusted", "LastSeen"), 
+            show="headings"
+        )
+        self.device_tree.heading("Key", text="Clave IP/MAC")
+        self.device_tree.heading("Name", text="Nombre de Usuario")
+        self.device_tree.heading("RiskScore", text="Puntuación de Riesgo 🚨")
+        self.device_tree.heading("Trusted", text="De Confianza")
+        self.device_tree.heading("LastSeen", text="Última Vista (Hora Local)")
+
+        self.device_tree.column("Key", width=150, anchor=tk.W, stretch=False)
+        self.device_tree.column("Name", width=150, anchor=tk.W, stretch=False)
+        self.device_tree.column("RiskScore", width=100, anchor=tk.CENTER, stretch=False)
+        self.device_tree.column("Trusted", width=80, anchor=tk.CENTER, stretch=False)
+        self.device_tree.column("LastSeen", width=200, anchor=tk.W, stretch=True)
+
+        self.device_tree.tag_configure('high_risk', background='#FFCCCC', foreground='black') 
+        self.device_tree.tag_configure('medium_risk', background='#FFFFCC', foreground='black') 
+        self.device_tree.tag_configure('trusted_status', foreground='green', font=('TkDefaultFont', 9, 'bold'))
+
+        tree_scrollbar = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.device_tree.yview)
+        self.device_tree.configure(yscrollcommand=tree_scrollbar.set)
+        tree_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.device_tree.pack(fill=tk.BOTH, expand=True)
+
+        self.device_tree.bind("<Button-3>", self.show_inventory_context_menu)
+
+        management_frame = tk.Frame(tab)
+        management_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=5, pady=5)
+        
+        refresh_button = ttk.Button(management_frame, text="🔄 Actualizar Lista", command=self.update_inventory_display)
+        refresh_button.pack(side=tk.LEFT, padx=5)
+
+        rename_button = ttk.Button(management_frame, text="✍️ Renombrar Dispositivo", command=self.rename_device)
+        rename_button.pack(side=tk.LEFT, padx=5)
+
+        reset_risk_button = ttk.Button(management_frame, text="✅ Restablecer Riesgo", command=self.reset_risk_score)
+        reset_risk_button.pack(side=tk.LEFT, padx=5)
+
+        trust_button = ttk.Button(management_frame, text="⭐ Alternar Confianza", command=self.toggle_trust_status)
+        trust_button.pack(side=tk.LEFT, padx=5)
+
+        return tab
+    
+    def update_inventory_display(self):
+        self.device_tree.delete(*self.device_tree.get_children())
+        
+        for key, info in self.inventory_manager.inventory.items():
+            risk_score = info.get('risk_score', 0)
+            
+            tag_list = []
+            if risk_score > 50: 
+                tag_list.append('high_risk')
+            elif risk_score > 10: 
+                tag_list.append('medium_risk')
+            
+            if info.get('trusted', False):
+                tag_list.append('trusted_status')
+
+            last_seen_formatted = datetime.fromtimestamp(info.get('last_seen', time.time())).strftime("%Y-%m-%d %H:%M:%S")
+
+            values = (
+                key, 
+                info.get('name', key), 
+                risk_score, 
+                "SÍ" if info.get('trusted', False) else "NO", 
+                last_seen_formatted
+            )
+            
+            self.device_tree.insert("", "end", values=values, tags=tuple(tag_list))
+        
+        self.status_bar.config(text=f"Inventario actualizado. Total de dispositivos: {len(self.inventory_manager.inventory)}")
+
+    def _get_selected_inventory_key(self):
+        selected_item = self.device_tree.focus()
+        if not selected_item:
+            messagebox.showwarning("Error de Selección", "Por favor, selecciona un dispositivo de la lista primero.")
+            return None
+        return self.device_tree.item(selected_item, 'values')[0]
+        
+    def rename_device(self):
+        key = self._get_selected_inventory_key()
+        if not key: return
+
+        current_name = self.inventory_manager.get_device_info(key).get('name', key)
+        new_name = simpledialog.askstring("Renombrar Dispositivo", f"Introduce el nuevo nombre para el dispositivo {key}:", initialvalue=current_name)
+
+        if new_name and new_name.strip() and new_name.strip() != current_name:
+            self.inventory_manager.set_device_name(key, new_name.strip())
+            self.update_inventory_display()
+            messagebox.showinfo("Éxito", f"Dispositivo {key} renombrado a '{new_name.strip()}'.")
+
+    def reset_risk_score(self):
+        key = self._get_selected_inventory_key()
+        if not key: return
+
+        if messagebox.askyesno("Confirmar Restablecimiento", f"¿Estás seguro de que quieres restablecer la puntuación de riesgo para {key}?"):
+            info = self.inventory_manager.get_device_info(key)
+            info['risk_score'] = 0
+            self.inventory_manager.save_inventory()
+            self.update_inventory_display()
+            messagebox.showinfo("Éxito", f"La puntuación de riesgo para {key} se ha restablecido a 0.")
+
+    def toggle_trust_status(self):
+        key = self._get_selected_inventory_key()
+        if not key: return
+            
+        info = self.inventory_manager.get_device_info(key)
+        new_trust_status = not info.get('trusted', False)
+        
+        status_text = "Sí" if new_trust_status else "No"
+        if messagebox.askyesno("Confirmar Estado de Confianza", f"¿Deseas establecer '{key}' como de confianza: {status_text}?"):
+            info['trusted'] = new_trust_status
+            self.inventory_manager.save_inventory()
+            self.update_inventory_display()
+            messagebox.showinfo("Éxito", f"El estado de confianza para {key} se estableció en: {status_text}.")
+
+    def show_inventory_context_menu(self, event):
+        self.device_tree.identify_row(event.y) 
+        key = self._get_selected_inventory_key()
+        if not key: return
+        
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label="✍️ Renombrar Dispositivo", command=self.rename_device)
+        menu.add_command(label="✅ Restablecer Riesgo", command=self.reset_risk_score)
+        menu.add_command(label="⭐ Alternar Confianza", command=self.toggle_trust_status)
+        
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
 
     def on_file_select(self):
         file_path = filedialog.askopenfilename(
             initialdir=self.base_dir,
-            title="Seleccionar un archivo PCAP",
+            title="Selecciona un archivo PCAP",
             filetypes=(("Archivos PCAP", "*.pcap"), ("Todos los archivos", "*.*"))
         )
         if file_path:
             self.current_pcap_file = file_path
-            self.load_packets(file_path, display_filter=self.filter_entry.get())
+
+            try:
+                self.status_bar.config(text=f"Cargando todos los paquetes Scapy de {os.path.basename(file_path)}...")
+                self.root.update_idletasks()
+                
+                self.all_packets = rdpcap(file_path) 
+                self.filtered_packets = list(self.all_packets)
+                
+                self.status_bar.config(text=f"Cargados {len(self.all_packets)} paquetes totales. Aplicando filtro de visualización...")
+                self.root.update_idletasks()
+                
+            except Exception as e:
+                messagebox.showerror("Error de Scapy", f"No se pudo cargar el PCAP con Scapy (requerido para filtro de flujo/exportación): {e}")
+                self.all_packets = []
+                self.filtered_packets = []
+                return
+
+            self.on_apply_filter()
 
     def on_apply_filter(self):
-        if self.current_pcap_file:
-            self.load_packets(self.current_pcap_file, display_filter=self.filter_entry.get())
-        else:
-            messagebox.showinfo("Error", "Por favor, abra un archivo PCAP primero.")
+        if not self.current_pcap_file or not self.all_packets:
+            messagebox.showinfo("Error", "Por favor, abre un archivo PCAP primero.")
+            return
 
+        display_filter = self.filter_entry.get().strip()
+        
+        self.status_bar.config(text=f"Aplicando filtro '{display_filter or 'ninguno'}'...")
+        self.root.update_idletasks()
+
+        try:
+            self.load_packets(self.current_pcap_file, display_filter=display_filter)
+            
+            self.status_bar.config(text=f"Filtro aplicado. Mostrando {len(self.detailed_packets_data)} paquetes.")
+        except Exception as e:
+            messagebox.showerror("Error de Filtro", f"Fallo al aplicar el filtro: {e}")
+            self.filtered_packets = []
+            self.clear_packet_display()
+            self.status_bar.config(text="Error al aplicar el filtro.")
+
+    def filter_by_flow(self):
+        selected_item = self.packet_tree.focus()
+        if not selected_item:
+            messagebox.showwarning("Filtro de Flujo", "Selecciona un paquete en la lista para filtrar por su flujo de conversación.")
+            return
+
+        frame_number_str = self.packet_tree.item(selected_item, 'values')[0]
+        if not frame_number_str or not self.all_packets: 
+            messagebox.showwarning("Filtro de Flujo", "No hay datos de paquete completo disponibles.")
+            return
+
+        try:
+            original_packet_index_in_all = int(frame_number_str) - 1
+            target_packet = self.all_packets[original_packet_index_in_all]
+        except (ValueError, IndexError):
+            messagebox.showwarning("Filtro de Flujo", "Error al localizar el paquete original para el análisis de flujo.")
+            return
+
+        src_ip = None
+        dst_ip = None
+        
+        if target_packet.haslayer(IP):
+            ip_layer = target_packet[IP]
+            src_ip = ip_layer.src
+            dst_ip = ip_layer.dst
+        elif target_packet.haslayer(IPv6):
+            ip_layer = target_packet[IPv6]
+            src_ip = ip_layer.src
+            dst_ip = ip_layer.dst
+        
+        if not (src_ip and dst_ip):
+            messagebox.showwarning("Filtro de Flujo", "El paquete seleccionado no es un paquete IP (IPv4 o IPv6).")
+            return
+
+        proto_name = None
+        
+        if target_packet.haslayer(TCP):
+            transport_layer = target_packet[TCP] 
+            proto_name = "tcp"
+        elif target_packet.haslayer(UDP):
+            transport_layer = target_packet[UDP]
+            proto_name = "udp"
+        else:
+            messagebox.showwarning("Filtro de Flujo", "El paquete seleccionado no pertenece a un flujo TCP o UDP.")
+            return
+            
+        sport = transport_layer.sport
+        dport = transport_layer.dport
+
+        filter_string = (
+            f"((ip.addr == {src_ip} and ip.addr == {dst_ip}) "
+            f"and ({proto_name}.port == {sport} and {proto_name}.port == {dport}))"
+        )
+
+        self.filter_entry.delete(0, tk.END)
+        self.filter_entry.insert(0, filter_string)
+        self.on_apply_filter()
+        
+    def save_filtered_pcap(self):
+        if not self.filtered_packets:
+             messagebox.showinfo("Error de Exportación", "No hay paquetes filtrados o cargados para exportar.")
+             return
+        
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".pcap",
+            filetypes=[("PCAP files", "*.pcap")],
+            title="Guardar PCAP Filtrado"
+        )
+        if file_path:
+            try:
+                wrpcap(file_path, self.filtered_packets)
+                messagebox.showinfo("Éxito", f"PCAP filtrado guardado exitosamente en: {file_path}")
+            except Exception as e:
+                messagebox.showerror("Error de Escritura", f"No se pudo guardar el archivo PCAP: {e}")
+    
     def on_search(self):
         query = self.search_entry.get().strip()
         if not query:
@@ -1654,31 +2049,25 @@ class PcapViewerGUI:
         self.status_bar.config(text=f"Cargando paquetes de '{os.path.basename(file_path)}' con filtro '{display_filter or 'ninguno'}'...") # Mensaje de carga de paquetes
         
         packet_count = 0 
-        self.detailed_packets_data = []
+        self.detailed_packets_data = [] 
+        self.filtered_packets = []      
+        tshark_frame_numbers = []
 
         try:
             tshark_cmd = [
                 "tshark", "-r", file_path,
                 "-T", "fields",
-                "-e", "frame.number",
-                "-e", "frame.time_epoch",
-                "-e", "frame.len", 
+                "-e", "frame.number", "-e", "frame.time_epoch", "-e", "frame.len", 
                 "-e", "eth.src", "-e", "eth.dst", 
-                "-e", "ip.src", "-e", "ipv6.src",
-                "-e", "ip.dst", "-e", "ipv6.dst",
-                "-e", "tcp.srcport", "-e", "tcp.dstport",
-                "-e", "udp.srcport", "-e", "udp.dstport",
-                "-e", "sctp.srcport", "-e", "sctp.dstport",
+                "-e", "ip.src", "-e", "ipv6.src", "-e", "ip.dst", "-e", "ipv6.dst",
+                "-e", "tcp.srcport", "-e", "tcp.dstport", "-e", "udp.srcport", "-e", "udp.dstport",
+                "-e", "sctp.srcport", "-e", "sctp.dstport", 
                 "-e", "frame.protocols",
-                "-e", "http.request.method", "-e", "http.request.uri",
-                "-e", "http.host", 
-                "-e", "dns.qry.name", "-e", "dns.resp.name",
-                "-e", "dns.resp.type", 
+                "-e", "http.request.method", "-e", "http.request.uri", "-e", "http.host", 
+                "-e", "dns.qry.name", "-e", "dns.resp.name", "-e", "dns.resp.type", 
                 "-e", "arp.opcode", "-e", "arp.src.hw_mac", "-e", "arp.dst.hw_mac",
                 "-e", "arp.src.proto_ipv4",
-                "-E", "separator=,",
-                "-E", "header=n",
-                "-E", "occurrence=f"
+                "-E", "separator=,", "-E", "header=n", "-E", "occurrence=f"
             ]
             
             if display_filter:
@@ -1712,7 +2101,7 @@ class PcapViewerGUI:
                 "tcp_srcport", "tcp_dstport", "udp_srcport", "udp_dstport",
                 "sctp_srcport", "sctp_dstport", 
                 "frame_protocols",
-                "http_request_method", "http_request_uri", "http_host",
+                "http_request_method", "http.request.uri", "http_host",
                 "dns_query_name", "dns_response_name", "dns_response_type", 
                 "arp_opcode", "arp_src_hw", "arp_dst_hw", "arp_src_proto_ipv4"
             ]
@@ -1726,13 +2115,14 @@ class PcapViewerGUI:
 
                     while len(parts) < len(field_names):
                         parts.append("")
-
                     if len(parts) > len(field_names):
                         parts = parts[:len(field_names)]
                     
                     packet_detail = dict(zip(field_names, parts))
 
                     frame_number = packet_detail.get("frame_number", "")
+                    tshark_frame_numbers.append(int(frame_number))
+                    
                     timestamp_epoch = float(packet_detail.get("frame_time_epoch", "0"))
                     dt_object = datetime.fromtimestamp(timestamp_epoch)
                     timestamp_formatted = dt_object.strftime("%H:%M:%S.%f")[:-3]
@@ -1744,33 +2134,23 @@ class PcapViewerGUI:
                     
                     protocols_raw = packet_detail.get("frame_protocols", "")
 
-                    http_method = packet_detail.get("http_request_method", "")
-                    http_uri = packet_detail.get("http_request_uri", "")
-                    http_host = packet_detail.get("http_host", "")
-                    dns_qry_name = packet_detail.get("dns_query_name", "")
-                    dns_resp_name = packet_detail.get("dns_response_name", "")
-                    arp_opcode = packet_detail.get("arp_opcode", "")
-                    arp_src_hw = packet_detail.get("arp_src_hw", "")
-                    arp_dst_hw = packet_detail.get("arp_dst_hw", "")
-                    arp_src_proto_ipv4 = packet_detail.get("arp_src_proto_ipv4", "")
-                    
                     proto, info = "DESCONOCIDO", protocols_raw
 
-                    if http_method:
-                        proto, info = "HTTP", f"{http_method} {http_uri} (Host: {http_host})"
-                    elif dns_qry_name or dns_resp_name:
+                    if packet_detail.get("http_request_method"):
+                        proto, info = "HTTP", f"{packet_detail.get('http_request_method')} {packet_detail.get('http.request.uri')} (Host: {packet_detail.get('http_host')})"
+                    elif packet_detail.get("dns_query_name") or packet_detail.get("dns_response_name"):
                         proto = "DNS"
-                        info = f"Consulta: {dns_qry_name}" if dns_qry_name else f"Respuesta: {dns_resp_name}"
-                    elif arp_opcode:
+                        info = f"Query: {packet_detail.get('dns_query_name')}" if packet_detail.get('dns_query_name') else f"Response: {packet_detail.get('dns_response_name')}"
+                    elif packet_detail.get("arp_opcode"):
                         proto = "ARP"
-                        info = f"¿Quién tiene ? Díselo a {arp_src_proto_ipv4}" if arp_opcode == '1' else f"{arp_src_proto_ipv4} está en {arp_src_hw}"
+                        info = f"Who has {packet_detail.get('arp_src_proto_ipv4')}? Tell {packet_detail.get('arp_src_hw')}" if packet_detail.get('arp_opcode') == '1' else f"{packet_detail.get('arp_src_proto_ipv4')} is at {packet_detail.get('arp_src_hw')}"
                     elif "tcp" in protocols_raw:
                         proto = "TCP"
                         info = f"{src_ip}:{src_port} -> {dst_ip}:{dst_port}"
                     elif "udp" in protocols_raw:
                         proto = "UDP"
                         info = f"{src_ip}:{src_port} -> {dst_ip}:{dst_port}"
-                    elif "ip" in protocols_raw:
+                    elif "ip" in protocols_raw or "ipv6" in protocols_raw:
                         proto = "IP" if packet_detail.get("ip_src") else "IPv6"
                         info = f"{src_ip} -> {dst_ip}"
                     
@@ -1781,20 +2161,31 @@ class PcapViewerGUI:
                 except (ValueError, IndexError) as e:
                     print(f"Error crítico de análisis en la línea de tshark: {e} - Línea: '{line}'")
                     continue
-                    
+
+            self.filtered_packets = []
+            if self.all_packets:
+                for frame_num in tshark_frame_numbers:
+                    scapy_index = frame_num - 1 
+                    if 0 <= scapy_index < len(self.all_packets):
+                        self.filtered_packets.append(self.all_packets[scapy_index])
+                    else:
+                        print(f"Advertencia: tshark informó el marco {frame_num} pero está fuera del rango para all_packets.")
+
         except FileNotFoundError:
-            messagebox.showerror("Error", "tshark no encontrado. Asegúrese de que Wireshark esté instalado y tshark en su PATH.")
+            messagebox.showerror("Error", "No se encontró tshark. Asegúrese de que Wireshark esté instalado y de que tshark esté en su PATH.")
             self.status_bar.config(text="Error: tshark no encontrado.")
         except subprocess.TimeoutExpired:
             proc.kill()
             stdout, stderr = proc.communicate()
-            messagebox.showerror("Error de tshark", "tshark tardó demasiado en responder y fue terminado.")
-            self.status_bar.config(text="Error: tiempo de espera de tshark agotado.")
+            messagebox.showerror("Error Tshark", "Tshark tomó demasiado tiempo para responder y fue terminado.")
+            self.status_bar.config(text="Error: tiempo de espera de tshark.")
         except Exception as e:
-            messagebox.showerror("Error", f"Ocurrió un error inesperado al cargar paquetes: {e}")
+            messagebox.showerror("Error", f"Se produjo un error inesperado al cargar paquetes: {e}")
             self.status_bar.config(text="Error inesperado al cargar paquetes.")
         
-        self.status_bar.config(text=f"Se cargaron {packet_count} paquetes.")
+        finally:
+            self.status_bar.config(text=f"Se cargaron {packet_count} paquetes en la pantalla. Se filtraron paquetes Scapy.: {len(self.filtered_packets)}")
+            self.root.update_idletasks()
 
     def on_export(self):
         if not self.detailed_packets_data:
