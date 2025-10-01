@@ -14,6 +14,7 @@ import ssl
 import dns.resolver
 import subprocess
 import re
+import math
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, scrolledtext, simpledialog
 from typing import Dict, List, Optional, Set, Tuple, Union, Any
@@ -702,6 +703,17 @@ class MitMDetection:
                     is_unusual = True
                     unusual_reason = f"Subdominio inusualmente largo ({len(parts[0])} caracteres)"
                     logging.debug(f"DEBUG: DNS Inusual - Longitud detectada: {dns_query}")
+                    
+                parts = dns_query.split('.')
+                if parts:
+                    subdomain_data = parts[0].encode('utf-8')
+                    entropy_score = self.calculate_shannon_entropy(subdomain_data)
+                    
+                    if entropy_score > 4.5:
+                        is_unusual = True
+                        unusual_reason = f"Alta Entropia ({entropy_score:.2f} en el subdominio. Posible Tunel DNS)"
+                        logging.debug(f"DEBUG: DNS Inusual - Alta Entropía detectada: {dns_query}")
+            
 
                 # Check 2: TLD sospechoso (si no es inusual por longitud)
                 if not is_unusual:
@@ -718,11 +730,12 @@ class MitMDetection:
                     with self.ui_lock:
                         alert_tuple = (time.strftime("%H:%M:%S"), src_ip, dns_query)
                         self.unusual_dns_queries.append(alert_tuple)
-                        logging.debug(f"DEBUG: DNS Inusual Añadido a la lista: {alert_tuple}") # Log cuando se añade
-                        
-                        # Limita la lista si crece demasiado
+                        logging.debug(f"DEBUG: DNS Inusual Añadido a la lista: {alert_tuple}")
+
                         if len(self.unusual_dns_queries) > 20:
                             self.unusual_dns_queries.pop(0)
+                        
+                        self.log_alert("DNS_EXFILTRATION", f"Consulta DNS inusual ({unusual_reason} desde {src_ip})", f"Consulta: {dns_query}", log_level=logging.WARNING)
 
         except Exception as e:
             logging.error(f"Error CRÍTICO en check_dns_query: {e}", exc_info=True)
@@ -782,7 +795,102 @@ class MitMDetection:
         
         self._dns_verif_cache[key] = False
         return False
+    
+    def calculate_shannon_entropy(self, data: bytes) -> float:
+        if not data:
+            return 0.0
+        
+        byte_counts = {}
+        for byte in data:
+            byte_counts[byte] = byte_counts.get(byte, 0) + 1
+        
+        data_len = len(data)
+        entropy = 0.0
+        for count in byte_counts.values():
+            probability = count / data_len
+            entropy -= probability * math.log2(probability)
+            
+        return entropy
+    
+    def check_icmp_tunneling(self, packet):
+        if not (packet.haslayer(IP) and packet.haslayer("ICMP")):
+            return
+            
+        ip_layer = packet[IP]
 
+        if packet["ICMP"].type not in [8, 0]:
+            return
+
+        raw_payload = bytes(packet[Raw].load) if packet.haslayer(Raw) else b''
+        payload_len = len(raw_payload)
+
+        if payload_len > 100:
+            entropy_score = self.calculate_shannon_entropy(raw_payload) 
+            
+            self.log_alert(
+                "ICMP_TUNNELING", 
+                "Payload de ICMP inusualmente grande",
+                f"Payload de {payload_len} bytes. Entropía: {entropy_score:.2f}. Posible túnel ICMP C2 entre {ip_layer.src} y {ip_layer.dst}.",
+                packet=packet,
+                log_level=logging.CRITICAL
+            )
+            self.inventory_manager.update_risk_score(ip_layer.src, 5)
+
+        flow_key = tuple(sorted((ip_layer.src, ip_layer.dst)))
+        now = time.time()
+        
+        self.icmp_traffic.setdefault(flow_key, []).append(now)
+        self.icmp_traffic[flow_key] = [t for t in self.icmp_traffic[flow_key] if now - t < 5] 
+
+        if len(self.icmp_traffic[flow_key]) > 20:
+            self.log_alert(
+                "ICMP_FLOOD_ANOMALY",
+                "Tráfico ICMP de alta frecuencia",
+                f"Se detectaron {len(self.icmp_traffic[flow_key])} pings en 5 segundos entre {ip_layer.src} y {ip_layer.dst}.",
+                packet=packet,
+                log_level=logging.WARNING
+            )
+
+    def check_ttl_hop_anomaly(self, packet):
+        if not packet.haslayer(IP):
+            return
+
+        ip_layer = packet[IP]
+        src_ip = ip_layer.src
+        dst_ip = ip_layer.dst
+        ttl = ip_layer.ttl
+
+        if src_ip not in self.trusted_ips and src_ip != self.my_ip_v4:
+            return
+            
+        ttl_base = 0
+        if ttl <= 64: ttl_base = 64
+        elif ttl <= 128: ttl_base = 128
+        elif ttl <= 255: ttl_base = 255
+        
+        if ttl_base == 0:
+            return
+
+        hop_count = ttl_base - ttl + 1
+        
+        if dst_ip not in self.hop_baseline:
+            self.hop_baseline[dst_ip] = hop_count
+            return
+            
+        baseline = self.hop_baseline[dst_ip]
+
+        if hop_count >= baseline + 1:
+            self.log_alert(
+                "HOP_COUNT_INCREASE",
+                f"Aumento de saltos inesperado a {dst_ip}",
+                f"Saltos: {baseline} -> {hop_count}. Un atacante podría haberse inyectado en la ruta (Man-in-the-Middle L3).",
+                packet=packet,
+                log_level=logging.CRITICAL
+            )
+            self.inventory_manager.update_risk_score(src_ip, 5)
+        elif hop_count < baseline:
+            self.hop_baseline[dst_ip] = hop_count
+    
     def check_dns_response(self, packet):
         try:
             if not (packet.haslayer(DNS) and packet[DNS].qr == 1):
@@ -811,12 +919,15 @@ class MitMDetection:
                 return
 
             packet_resolved_ips: List[str] = []
+            low_ttl_detected = False
             ancount = int(getattr(packet[DNS], 'ancount', 0) or 0)
             if ancount > 0 and getattr(packet[DNS], 'an', None):
                 ans = packet[DNS].an
                 for _ in range(ancount):
                     if getattr(ans, 'type', None) == 1 and hasattr(ans, 'rdata'):
                         packet_resolved_ips.append(str(ans.rdata))
+                        if hasattr(ans, 'ttl') and ans.ttl < 60:
+                            low_ttl_detected = True
                     ans = getattr(ans, 'payload', None)
                     if ans is None:
                         break
@@ -857,7 +968,15 @@ class MitMDetection:
                     )
                     self.dns_responses[query_name] = set(packet_resolved_ips)
                     return
-
+                
+            if low_ttl_detected:
+                self.log_alert(
+                    "DNS_LOW_TTL", 
+                    f"TTL Inusualmente Bajo en Respuesta DNS para '{query_name}'", 
+                    f"Se recibió un TTL < 60s. Indicador común de Spoofing DNS activo. IPs: {packet_resolved_ips}", 
+                    packet=packet,
+                    log_level=logging.WARNING
+                )
 
             self.log_alert(
                 "DNS_UNVERIFIED",
@@ -941,11 +1060,34 @@ class MitMDetection:
 
                 elif msg_type == 2:
                     src_ip = packet[IP].src if packet.haslayer(IP) else '0.0.0.0'
+                    src_mac = packet[Ether].src
                     if src_ip != self.gateway_ip_v4 and src_ip not in self.trusted_ips:
                         self.log_alert(
                             "DHCP_SPOOFING",
                             "Servidor DHCP no autorizado detectado",
-                            f"IP sospechosa: {src_ip}, MAC: {packet[Ether].src}",
+                            f"IP sospechosa: {src_ip}, MAC: {src_mac}",
+                            packet=packet,
+                            log_level=logging.CRITICAL
+                        )
+                    else:
+                        rogue_params = []
+                    
+                    options = dict(packet[DHCP].options)
+                    router_ip = options.get('router', [None])[0]
+                    dns_servers = options.get('name_server', [])
+
+                    if router_ip and router_ip != self.gateway_ip_v4:
+                        rogue_params.append(f"Router ({router_ip}) no coincide con el gateway conocido ({self.gateway_ip_v4})")
+
+                    for dns_ip in dns_servers:
+                        if dns_ip not in self.trusted_ips:
+                            rogue_params.append(f"Servidor DNS ({dns_ip}) no está en la lista de confianza")
+                            
+                    if rogue_params:
+                        self.log_alert(
+                            "DHCP_PARAM_INJECTION",
+                            "Servidor DHCP inyectando parámetros maliciosos",
+                            f"MAC: {src_mac}, Problemas: {'; '.join(rogue_params)}",
                             packet=packet,
                             log_level=logging.CRITICAL
                         )
@@ -1581,7 +1723,6 @@ class MitMDetection:
         self.generate_network_diagram()
         self.active = False
         self.stop_event.set()
-
 
 # -------------------- CLI --------------------
 
