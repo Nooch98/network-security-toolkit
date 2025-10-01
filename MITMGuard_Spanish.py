@@ -258,6 +258,10 @@ class MitMDetection:
         self.inventory_manager = DeviceInventory(BASE_DIR)
         self.tcp_flow_tracking: Dict[Tuple, int] = {}
         self.MAX_RISK_SCORE = 15
+        self.scan_history: Dict[str, Dict[str, List[Tuple[int, float]]]] = {}
+        self.SCAN_WINDOW: int = 5
+        self.PORT_SCAN_THRESHOLD: int = 15
+        self.HOST_SCAN_THRESHOLD: int = 10
         
         if self.json_out:
             json_path = self.json_out
@@ -393,23 +397,68 @@ class MitMDetection:
     def _check_for_trackers(self, src_ip: str, dst_domain: str):
         for tracker_domain in self.tracker_domains:
             if tracker_domain in dst_domain: 
-                # Ahora añadimos un nuevo diccionario para cada intento detectado
-                # Podemos añadir un timestamp si queremos
                 attempt_info = {
                     "src_ip": src_ip,
                     "tracker_domain": tracker_domain,
-                    "full_dst_domain": dst_domain, # El dominio exacto al que se conectó
+                    "full_dst_domain": dst_domain,
                     "timestamp": time.time()
                 }
                 self.tracking_attempts.append(attempt_info)
                 
-                self.log_alert( # Esto genera el log y debería actualizar la UI
+                self.log_alert(
                     "TRACKING_ATTEMPT", 
                     f"Intento de Rastreo Detectado desde {src_ip}",
                     f"Dispositivo {src_ip} conectado a dominio de rastreo: {dst_domain}"
                 )
                 self.console.print(f"[bold magenta]ALERTA TRACKER:[/bold magenta] {dst_domain} desde {src_ip}") 
-                return # Detener al encontrar el primer match para este paquete
+                return
+            
+    def check_ip_fragment_evasion(self, packet):
+        if not packet.haslayer(IP):
+            return
+        
+        ip_layer = packet[IP]
+        
+        if ip_layer.frag > 0 or (ip_layer.flags & 0x01):
+            if len(ip_layer.payload) < 28:
+                pcap_path = self.log_malicious_packet(packet, "FRAGMENTATION_ANOMALY")
+                
+                details = {
+                    'src_ip': ip_layer.src,
+                    'dst_ip': ip_layer.dst,
+                    'ip_flags': ip_layer.flags,
+                    'fragment_offset': ip_layer.frag,
+                    'total_length': ip_layer.len,
+                    'pcpa_file': pcap_path
+                }
+                
+                self.log_alert("FRAGMENTATION_ANOMALY", "Fragmento IP inusualmente pequeño",
+                               f"Host {ip_layer.src} enviando fragmento pequeño (Longitud Total: {ip_layer.len}). Usado para evasión de filtros.", 
+                            packet=packet, log_level=logging.WARNING
+                           )
+    
+    def check_unusual_ip_options(self, packet):
+        if not packet.haslayer(IP):
+            return
+
+        ip_layer = packet[IP]
+
+        if ip_layer.ihl > 5:
+            if hasattr(ip_layer, 'options') and ip_layer.options:
+                options_summary = str(ip_layer.options)
+                
+                pcap_path = self.log_malicious_packet(packet, "IP_OPTION_EVASION")
+
+                details = {
+                    'src_ip': ip_layer.src,
+                    'dst_ip': ip_layer.dst,
+                    'ip_options': options_summary,
+                    'pcap_file': pcap_path,
+                }
+                
+                self.log_alert("IP_OPTION_EVASION", "Opciones IP No Estándar Detectadas", 
+                            f"Host {ip_layer.src} usa opciones IP raras: {options_summary}. Posible evasión o manipulación de ruta.", 
+                            packet=packet, log_level=logging.WARNING)
     
     def _update_fingerprint(self, ip: str, packet):
         fp = self.device_fp.setdefault(ip, {'ttls': set(), 'tcp_windows': set(), 'http_ua': set(), 'dhcp_client_ids': set()})
@@ -1032,6 +1081,45 @@ class MitMDetection:
         except Exception as e:
             self.logger.error(f"Error en check_anomalous_packets: {e}")
     
+    def check_new_internal_connections(self, packet):
+        if not (packet.haslayer(IP) and packet.haslayer(TCP)):
+            return
+
+        ip_layer = packet[IP]
+        tcp_layer = packet[TCP]
+        is_internal = (ip_layer.src in self.network_map and ip_layer.dst in self.network_map)
+        is_gateway_traffic = (ip_layer.dst == self.gateway_ip_v4 or ip_layer.src == self.gateway_ip_v4)
+        
+        if not is_internal or is_gateway_traffic:
+            return
+
+        if (tcp_layer.flags & 0x02) != 0x02:
+            return
+
+        flow_key = (ip_layer.src, ip_layer.dst, tcp_layer.dport)
+        
+        if flow_key not in self.internal_flows:
+            self.internal_flows.add(flow_key)
+
+            is_high_risk_port = (tcp_layer.dport not in [22, 23, 80, 443, 3389, 445])
+            
+            alert_type = "LATERAL_MOVEMENT_RISK" if is_high_risk_port else "NEW_INTERNAL_FLOW"
+            log_level = logging.CRITICAL if is_high_risk_port else logging.WARNING
+
+            pcap_path = self.log_malicious_packet(packet, alert_type)
+
+            details = {
+                'src_ip': ip_layer.src,
+                'dst_ip': ip_layer.dst,
+                'dst_port': tcp_layer.dport,
+                'is_risky_port': is_high_risk_port,
+                'pcap_file': pcap_path,
+            }
+            
+            self.log_alert(alert_type, f"Flujo Interno Nuevo Detectado a Puerto {tcp_layer.dport}", 
+                        f"Host {ip_layer.src} inició una conexión a {ip_layer.dst}:{tcp_layer.dport} por primera vez.", 
+                        packet=packet, log_level=log_level)
+    
     def handle_dhcp_packet(self, packet):
         """Maneja paquetes DHCP y busca ataques de spoofing y starvation."""
         try:
@@ -1185,10 +1273,57 @@ class MitMDetection:
 
         self.tcp_flow_tracking[flow_key] = current_seq
     
+    def _cleanup_scan_history(self):
+        now = time.time()
+        
+        for src_ip in list(self.scan_history.keys()):
+            for dst_ip in list(self.scan_history[src_ip].keys()):
+                self.scan_history[src_ip][dst_ip] = [
+                        (port, ts) for port, ts in self.scan_history[src_ip][dst_ip]
+                        if now - ts < self.SCAN_WINDOW
+                    ]
+                
+                if not self.scan_history[src_ip][dst_ip]:
+                    del self.scan_history[src_ip][dst_ip]
+                
+            
+            if not self.scan_history[src_ip]:
+                del self.scan_history[src_ip]
+    
     def handle_tcp_traffic(self, packet, src_ip, dst_ip):
         try:
             if packet.haslayer(TCP):
                 tcp_packet = packet[TCP]
+
+                if src_ip and dst_ip and (tcp_packet.flags & 0x02): 
+                    
+                    now = time.time()
+                    dst_port = tcp_packet.dport
+
+                    self._cleanup_scan_history() 
+                    self.scan_history.setdefault(src_ip, {}).setdefault(dst_ip, []).append((dst_port, now))
+
+                    ports_hit = set(
+                        port for port, ts in self.scan_history[src_ip].get(dst_ip, [])
+                        if now - ts < self.SCAN_WINDOW 
+                    )
+                    
+                    if len(ports_hit) >= self.PORT_SCAN_THRESHOLD:
+                        self.inventory_manager.update_risk_score(src_ip, 3) 
+                        logging.warning(
+                            f"[ALERTA SCANNING] Dispositivo {src_ip} realizando Port Scan contra {dst_ip}. "
+                            f"Puertos únicos: {len(ports_hit)}"
+                        )
+
+                    unique_dst_ips = set(self.scan_history.get(src_ip, {}).keys())
+                            
+                    if len(unique_dst_ips) >= self.HOST_SCAN_THRESHOLD:
+                        self.inventory_manager.update_risk_score(src_ip, 5) 
+                        logging.critical(
+                            f"[ALERTA SWEEP] Dispositivo {src_ip} realizando Host Sweep. "
+                            f"IPs de destino únicas: {len(unique_dst_ips)}"
+                        )
+
                 flags_str = ""
                 flags = tcp_packet.flags
                 
@@ -1197,7 +1332,7 @@ class MitMDetection:
                 if flags & 0x01: flags_str += "[bold red]F[/bold red]"
                 if flags & 0x04: flags_str += "[bold red]R[/bold red]"
                 if flags & 0x08: flags_str += "[bold cyan]P[/bold cyan]"
-                
+
                 protocol = COMMON_PORTS.get(tcp_packet.dport, "Desconocido")
                 
                 request_info = {
@@ -1214,6 +1349,7 @@ class MitMDetection:
                     self.tcp_requests.insert(0, request_info)
                     if len(self.tcp_requests) > self.max_tcp_requests:
                         self.tcp_requests.pop()
+                        
         except Exception as e:
             logging.debug(f"Error procesando paquete TCP: {e}")
     
@@ -1350,6 +1486,9 @@ class MitMDetection:
                     self._update_fingerprint(src_ip, packet)
                     self._check_tcp_sequence_anomaly(packet)
                     self.check_anomalous_packets(packet)
+                    self.check_ip_fragment_evasion(packet)
+                    self.check_unusual_ip_options(packet)
+                    self.check_new_internal_connections(packet)
                 if packet.haslayer(HTTPRequest):
                     self.check_for_sslstrip(packet)
                     self.check_for_credentials(packet)
