@@ -14,7 +14,7 @@ import ssl
 import dns.resolver
 import subprocess
 import re
-import packaging
+import math
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, scrolledtext, simpledialog
 from typing import Dict, List, Optional, Set, Tuple, Union, Any
@@ -807,6 +807,101 @@ class MitMDetection:
         self._dns_verif_cache[key] = False
         return False
 
+    def calculate_shannon_entropy(self, data: bytes) -> float:
+        if not data:
+            return 0.0
+        
+        byte_counts = {}
+        for byte in data:
+            byte_counts[byte] = byte_counts.get(byte, 0) + 1
+        
+        data_len = len(data)
+        entropy = 0.0
+        for count in byte_counts.values():
+            probability = count / data_len
+            entropy -= probability * math.log2(probability)
+            
+        return entropy
+    
+    def check_icmp_tunneling(self, packet):
+        if not (packet.haslayer(IP) and packet.haslayer("ICMP")):
+            return
+            
+        ip_layer = packet[IP]
+
+        if packet["ICMP"].type not in [8, 0]:
+            return
+
+        raw_payload = bytes(packet[Raw].load) if packet.haslayer(Raw) else b''
+        payload_len = len(raw_payload)
+
+        if payload_len > 100:
+            entropy_score = self.calculate_shannon_entropy(raw_payload) 
+            
+            self.log_alert(
+                "ICMP_TUNNELING", 
+                "Unusually large ICMP payload",
+                f"Payload of {payload_len} bytes. Entropy: {entropy_score:.2f}. Possible ICMP C2 tunnel between {ip_layer.src} and {ip_layer.dst}.",
+                packet=packet,
+                log_level=logging.CRITICAL
+            )
+            self.inventory_manager.update_risk_score(ip_layer.src, 5)
+
+        flow_key = tuple(sorted((ip_layer.src, ip_layer.dst)))
+        now = time.time()
+        
+        self.icmp_traffic.setdefault(flow_key, []).append(now)
+        self.icmp_traffic[flow_key] = [t for t in self.icmp_traffic[flow_key] if now - t < 5] 
+
+        if len(self.icmp_traffic[flow_key]) > 20:
+            self.log_alert(
+                "ICMP_FLOOD_ANOMALY",
+                "High-frequency ICMP traffic",
+                f"{len(self.icmp_traffic[flow_key])} pings detected within 5 seconds between {ip_layer.src} and {ip_layer.dst}.",
+                packet=packet,
+                log_level=logging.WARNING
+            )
+
+    def check_ttl_hop_anomaly(self, packet):
+        if not packet.haslayer(IP):
+            return
+
+        ip_layer = packet[IP]
+        src_ip = ip_layer.src
+        dst_ip = ip_layer.dst
+        ttl = ip_layer.ttl
+
+        if src_ip not in self.trusted_ips and src_ip != self.my_ip_v4:
+            return
+            
+        ttl_base = 0
+        if ttl <= 64: ttl_base = 64
+        elif ttl <= 128: ttl_base = 128
+        elif ttl <= 255: ttl_base = 255
+        
+        if ttl_base == 0:
+            return
+
+        hop_count = ttl_base - ttl + 1
+        
+        if dst_ip not in self.hop_baseline:
+            self.hop_baseline[dst_ip] = hop_count
+            return
+            
+        baseline = self.hop_baseline[dst_ip]
+
+        if hop_count >= baseline + 1:
+            self.log_alert(
+                "HOP_COUNT_INCREASE",
+                f"Unexpected jump increase to {dst_ip}",
+                f"Jumps: {baseline} -> {hop_count}. An attacker could have injected himself into the route (Man-in-the-Middle L3).",
+                packet=packet,
+                log_level=logging.CRITICAL
+            )
+            self.inventory_manager.update_risk_score(src_ip, 5)
+        elif hop_count < baseline:
+            self.hop_baseline[dst_ip] = hop_count
+    
     def check_dns_response(self, packet):
         try:
             if not (packet.haslayer(DNS) and packet[DNS].qr == 1):
@@ -829,12 +924,15 @@ class MitMDetection:
             if query_name.endswith('.local'):
                 return
             packet_resolved_ips: List[str] = []
+            low_ttl_detected = False
             ancount = int(getattr(packet[DNS], 'ancount', 0) or 0)
             if ancount > 0 and getattr(packet[DNS], 'an', None):
                 ans = packet[DNS].an
                 for _ in range(ancount):
                     if getattr(ans, 'type', None) == 1 and hasattr(ans, 'rdata'):
                         packet_resolved_ips.append(str(ans.rdata))
+                        if hasattr(ans, 'ttl') and ans.ttl < 60:
+                            low_ttl_detected = True
                     ans = getattr(ans, 'payload', None)
                     if ans is None:
                         break
@@ -870,7 +968,17 @@ class MitMDetection:
                         packet=packet,
                     )
                     self.dns_responses[query_name] = set(packet_resolved_ips)
-                    
+                    return
+            
+            if low_ttl_detected:
+                self.log_alert(
+                    "DNS_LOW_TTL", 
+                    f"Unusually Low TTL on DNS Response for '{query_name}'", 
+                    f"A TTL < 60s was received. Common indicator of active DNS spoofing. IPs: {packet_resolved_ips}", 
+                    packet=packet,
+                    log_level=logging.WARNING
+                ) 
+            
             self.log_alert("DNS_UNVERIFED",
                     f"Unusual DNS response for {query_name}", f"Expected: {sorted(valid_ips)}; Received: {packet_resolved_ips}",
                     packet=packet,
@@ -952,11 +1060,34 @@ class MitMDetection:
 
                 elif msg_type == 2:
                     src_ip = packet[IP].src if packet.haslayer(IP) else '0.0.0.0'
+                    src_mac = packet[Ether].src
                     if src_ip != self.gateway_ip_v4 and src_ip not in self.trusted_ips:
                         self.log_alert(
                             "DHCP_SPOOFING",
                             "Rogue DHCP server detected",
-                            f"Suspicious IP: {src_ip}, MAC: {packet[Ether].src}",
+                            f"Suspicious IP: {src_ip}, MAC: {src_mac}",
+                            packet=packet,
+                            log_level=logging.CRITICAL
+                        )
+                    else:
+                        rogue_params = []
+                    
+                    options = dict(packet[DHCP].options)
+                    router_ip = options.get('router', [None])[0]
+                    dns_servers = options.get('name_server', [])
+
+                    if router_ip and router_ip != self.gateway_ip_v4:
+                        rogue_params.append(f"Router ({router_ip}) does not match the known gateway ({self.gateway_ip_v4})")
+
+                    for dns_ip in dns_servers:
+                        if dns_ip not in self.trusted_ips:
+                            rogue_params.append(f"DNS server ({dns_ip}) is not in the trusted list")
+                            
+                    if rogue_params:
+                        self.log_alert(
+                            "DHCP_PARAM_INJECTION",
+                            "DHCP server injecting malicious parameters",
+                            f"MAC: {src_mac}, Issues: {'; '.join(rogue_params)}",
                             packet=packet,
                             log_level=logging.CRITICAL
                         )
@@ -1619,9 +1750,8 @@ class PcapViewerGUI:
         self.root = root
         self.base_dir = base_dir
         self.root.title("MITMGuard - Pcap Viewer & Detection Analysis")
-        self.root.geometry("1400x900") # Tamaño aumentado para el nuevo diseño
+        self.root.geometry("1400x900")
 
-        # NUEVO: Inicializar el gestor de inventario
         self.inventory_manager = DeviceInventory(self.base_dir) 
 
         self.config_options = {
@@ -1629,9 +1759,9 @@ class PcapViewerGUI:
         }
 
         self.current_pcap_file = None
-        self.all_packets = []        # Scapy packets loaded directly (needed for save_filtered_pcap and filter_by_flow)
-        self.filtered_packets = []   # Packets currently shown (used for filtering and exporting)
-        self.detailed_packets_data = [] # List of dictionaries from tshark (used for display and JSON/CSV export)
+        self.all_packets = []
+        self.filtered_packets = []
+        self.detailed_packets_data = []
         
         # Atributos de búsqueda
         self.search_index_proto = "1.0"
@@ -1639,25 +1769,21 @@ class PcapViewerGUI:
         
         self.create_widgets()
         self.status_bar.config(text="Ready. Select a PCAP file to start.")
-        self.update_inventory_display() # Cargar el inventario al inicio
+        self.update_inventory_display()
 
     def create_widgets(self):
-        # 1. Crear el Notebook para las pestañas
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        # 2. Crear las dos pestañas principales
         packet_tab = self._create_packet_analysis_tab(self.notebook)
         inventory_tab = self._create_inventory_tab(self.notebook)
 
         self.notebook.add(packet_tab, text="🔍 Packet Analysis")
         self.notebook.add(inventory_tab, text="🚨 Device Inventory & Risk")
 
-        # 3. La barra de estado se queda en la raíz de la ventana
         self.status_bar = ttk.Label(self.root, text="Ready", relief=tk.SUNKEN, anchor=tk.W)
         self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
 
-        # Configuración de tags de búsqueda (mantener aquí si las cajas de texto están definidas)
         if hasattr(self, 'proto_details_text'):
              self.proto_details_text.tag_configure("found", background="yellow", foreground="black")
              self.hex_dump_text.tag_configure("found", background="yellow", foreground="black")
